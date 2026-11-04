@@ -1,0 +1,33 @@
+{
+  "workflow_key": "learning-printables.v1",
+  "stages": [
+    {
+      "key": "normalize",
+      "input_schema": "learning.normalize.input.v1",
+      "output_schema": "learning.normalize.output.v1",
+      "max_attempts": 3,
+      "retry_delay_seconds": 1
+    },
+    {
+      "key": "compile",
+      "input_schema": "learning.compile.input.v1",
+      "output_schema": "learning.compile.output.v1",
+      "max_attempts": 3,
+      "retry_delay_seconds": 1
+    },
+    {
+      "key": "render",
+      "input_schema": "learning.render.input.v1",
+      "output_schema": "learning.render.output.v1",
+      "max_attempts": 3,
+      "retry_delay_seconds": 1
+    },
+    {
+      "key": "verify",
+      "input_schema": "learning.verify.input.v1",
+      "output_schema": "learning.verify.output.v1",
+      "max_attempts": 3,
+      "retry_delay_seconds": 1
+    }
+  ]
+}

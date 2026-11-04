@@ -1,0 +1,130 @@
+# Lambda target (image package type). Same ECR image the ECS target in
+# iac/terraform/ deploys -- ${env:IMAGE_URI} is the one shared seam (plan
+# section 8: "two IaC tools ... own disjoint resources with a single,
+# explicit seam -- the ECR repository and the image digest").
+#
+# `IMAGE_URI` must be a digest pin (repo@sha256:...), never a floating tag --
+# promoting a tag can silently move which bytes run; a digest cannot.
+#
+# Not applied by this template. `sls deploy --stage <env>` is a CI/CD step
+# (`.github/workflows/service-template.yml`), gated behind manual approval,
+# never run ad hoc against a shared account.
+
+service: foundry-workflow
+
+provider:
+  name: aws
+  region: ${env:AWS_REGION, "eu-west-1"}
+  stage: ${opt:stage, "dev"}
+  ecr:
+    images:
+      workflow-image:
+        uri: ${env:IMAGE_URI}
+  environment:
+    SERVICE_ENV: ${self:provider.stage}
+    PRINCIPAL_ISSUER: foundry-workflow
+    # /tmp is the only writable path in a Lambda image. The name is this SERVICE's:
+    # `widgets.db` was the emitted example domain and read, in a deploy log, as if a
+    # workflow ledger stored widgets.
+    DB_PATH: /tmp/workflow.db
+    # The workflow this deployment runs. There is no built-in default and no fallback:
+    # a workflow service with no workflow accepts jobs it can never advance, and every
+    # command would be refused as workflow_digest_mismatch, which reads as a caller bug.
+    WORKFLOW_DEFINITION_PATH: /app/contracts/workflow.v1.json
+    # ONE value names the ledger's physical tables AND the set the package's write-guard
+    # permits. See adapters/real/sql_workflow_engine.py: a second literal written at the
+    # default is the defect this estate has already paid for.
+    WORKFLOW_TABLE_PREFIX: ${env:WORKFLOW_TABLE_PREFIX, "wf_"}
+    # EVENT_BUS_MODE is deliberately NOT set. It read `outbox`,
+    # and this service really does have an outbox and now a drain --
+    # which is exactly why the variable was misleading rather than merely redundant.
+    # Nothing selects a bus from it: config.py validates only the 'sqs' case, 'outbox'
+    # is in the Literal and handled nowhere, container.py builds `publisher or
+    # InProcessEventBus()` unconditionally, and _ledger_broker_factory picks the drain's
+    # downstream from SQS_QUEUE_URL -- refusing with ConfigurationError when it is unset.
+    # So SQS_QUEUE_URL below is the real switch. Setting EVENT_BUS_MODE again without
+    # first making a composition root read it re-creates a claim nothing can honour.
+    SQS_QUEUE_URL: ${env:SQS_QUEUE_URL, ""}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource: ${env:SQS_QUEUE_ARN, "*"}
+
+functions:
+  api:
+    image:
+      name: workflow-image
+    memorySize: 512
+    timeout: 29 # API Gateway's own ceiling; a genuinely longer job belongs on ECS (plan section 3)
+    events:
+      - httpApi: "*"
+    environment:
+      AWS_LWA_PORT: "8080"
+
+# There is deliberately only ONE function. A second, `drainOutbox`, used to be
+# declared here on a `rate(1 minute)` schedule with this as its entire body:
+#
+#     command: [/opt/venv/bin/python, -c,
+#               "from ...handlers.outbox_drain import handle_scheduled_drain"]
+#
+# IT DID NOT EVEN DO THAT, and the correction matters more than the original
+# finding. `image.command` sets the container's CMD, and this image's ENTRYPOINT
+# is `docker/entrypoint.sh`, which until 2026-09-05 never named `"$@"`. The
+# arguments arrived and were discarded. Measured by running that script with
+# exactly those arguments against a stub interpreter: the argv it launched was
+# `-m shepherd_workflow_service.main`, unchanged. So EventBridge started the HTTP
+# API SERVER 1440 times a day, and both the AWS console and this repository's IaC
+# gate showed it green, because the only thing either of them checked was that a
+# function by that name existed.
+#
+# `docker/entrypoint.sh` now execs an explicit command when it is given one, so
+# `image.command` here is live rather than decorative -- which is also what makes
+# the gate's import-only arm load-bearing instead of a check on a discarded
+# string (`tests/shape/test_entrypoint.py` pins both directions).
+#
+# The command was inherited verbatim from the service template, which has
+# since deleted it at source. The gate arm that now refuses an import-only command
+# was inherited from the same place.
+#
+# READ THE NAME CAREFULLY, BECAUSE THIS SERVICE HAS TWO OUTBOXES AND THEY ARE NOT THE
+# SAME ONE. The deleted function pointed at `handlers/outbox_drain.py`, which belongs to
+# the TEMPLATE-inherited `Publisher` / `OutboxEventBus` pair -- and nothing in this
+# service publishes through it (`git grep publish( -- src/<pkg>/services
+# src/<pkg>/controllers` returns nothing, against a positive control of 3 files matching
+# `def ` in those same directories), so that outbox is always empty.
+#
+# The outbox that DOES fill is the workflow ledger's: `SqlAlchemyOutbox`, built at
+# `adapters/real/sql_workflow_engine.py:226`, written by `runner.py`'s
+# `self._outbox.enqueue(...)` inside the engine's own transaction, into the
+# `<prefix>outbox` table the live proof observed as `wf_outbox`.
+#
+# So a scheduled Lambda called `drainOutbox` here was worse than merely inert. It read as
+# the drainer for the ledger outbox that genuinely accumulates rows, while pointing at an
+# unrelated and unwired module. Deleting it removes a false assurance; it removes no
+# durability, because it never drained anything.
+#
+# THE LEDGER OUTBOX NOW HAS A DRAINER, AND IT IS STILL NOT SCHEDULED HERE.
+# `src/shepherd_workflow_service/ledger_drain_main.py` is a real process --
+# `python -m shepherd_workflow_service.ledger_drain_main` -- proved end to end in
+# `tests/integration/test_ledger_drain_entrypoint.py` against a real queue endpoint.
+# No scheduled function is declared for it in THIS file, on purpose:
+#
+#   This is an image-package-type Lambda whose one process is the AWS Lambda Web
+#   Adapter forwarding each invocation to a listening HTTP server. A CMD override
+#   that runs a one-shot script and exits leaves nothing for the adapter to
+#   forward to. Declaring `drainLedgerOutbox` here would produce a second function
+#   whose name asserts an action it does not perform -- the exact defect the
+#   deletion above was for, re-created with a different body.
+#
+# The honest deployment surface is the ECS target in `iac/terraform/`, as a
+# scheduled task overriding `command`. That is a separate slice with its own
+# evidence, recorded there rather than implied by this file.
+
+resources:
+  Outputs:
+    ApiUrl:
+      Value:
+        Fn::GetAtt: [HttpApi, ApiEndpoint]

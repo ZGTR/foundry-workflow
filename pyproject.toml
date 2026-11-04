@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mshaker-shared-workflow"
+version = "0.1.0"
+description = "Reference service: one image, deployable to Lambda or ECS, worked domain included"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.7",
+    # The workflow ledger is SQL. `shepherd_workflow.sql` builds the tables and
+    # runs the conditional UPDATE that makes two racing callers safe, so this is
+    # a hard runtime dependency, not an extra: the service has no non-SQL mode.
+    "sqlalchemy>=2.0",
+]
+
+[project.optional-dependencies]
+aws = ["boto3>=1.34"]
+# Signature-verifying auth. An extra rather than a hard dependency because a
+# local run legitimately uses the header adapter, and `cryptography` is a heavy
+# build for a service that never verifies a token. `build_container()` refuses to
+# start non-locally without real auth, so omitting this extra fails loudly at
+# startup rather than quietly downgrading.
+jwt = ["pyjwt[crypto]>=2.9"]
+# MySQL 8 persistence. An extra rather than a hard dependency because the SQLite
+# adapter is the local default and needs no server; `container.py` imports the
+# MySQL adapter only on the `db_backend='mysql'` branch, and
+# `tests/unit/test_mysql_import_guard.py` proves the module imports without the
+# driver and refuses at CONSTRUCTION with ConfigurationError rather than leaking
+# a vendor ImportError.
+mysql = ["pymysql>=1.1"]
+dev = ["httpx>=0.27", "jsonschema>=4.20", "pyjwt[crypto]>=2.9", "pymysql>=1.1"]
+
+[tool.hatch.build.targets.wheel]
+# The service ships these vendored packages in its container and Python wheel.
+# Neither vendor directory is a separate installable distribution.
+packages = [
+    "src/shepherd_workflow_service",
+    "vendor/shepherd_contracts",
+    "vendor/shepherd_workflow",
+]
+
+[tool.ruff]
+# INLINED, not extended. A service repo has no parent to extend from; the
+# template's `extend = "../../pyproject.toml"` resolves outside this checkout.
+# These are the monorepo's settings, copied at emit time -- if they drift, the
+# service is still lintable, which is the property that matters here.
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"os.environ".msg = "Packages must not read the environment; inject config through the constructor." 
+
+[tool.ruff.lint.per-file-ignores]
+# config.py is the one designated composition-root module allowed to read
+# os.environ (see its own docstring, and the root pyproject.toml's banned-api
+# message). tests/unit/test_config.py and tests/shape/test_layering.py both
+# assert this stays the ONLY exception.
+"src/shepherd_workflow_service/config.py" = ["TID251"]
+# Tests read the environment on purpose: `SHEPHERD_TEST_MYSQL_URL` selects the
+# integration target for the repository contract, and `test_new_service_script.py`
+# builds an env for the subprocess it runs. The ban's stated subject is the
+# PACKAGE -- "blackbox packages must not read the environment; inject config
+# through the constructor" -- and src/ is still held to it in full.
+"tests/**" = ["TID251"]

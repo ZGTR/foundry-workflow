@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shepherd.zgtr/blackbox/workflow-ledger/command.v1.json",
+  "title": "workflow-ledger command v1",
+  "description": "One command against one stage run: `POST /v1/stage-runs/{stage_run_id}/commands`. Served by `schemas/workflow.py::CommandRequest`; the refusal vocabulary is `shepherd_workflow.state.RefusalClass` and the status mapping is `services/workflow_service.py`. An ACCEPTED command answers with the stage run shape published in `stage_run.v1.json#/properties/stage_run` -- the same object `GET /v1/stage-runs/{id}` returns, so a caller never reconciles two views of one row. That shape is not `$ref`-ed here on purpose: a cross-file reference that fails to resolve raises only when an instance is validated, so it would leave this file looking checked while checking nothing.",
+  "type": "object",
+  "properties": {
+    "request": {
+      "type": "object",
+      "required": [
+        "kind",
+        "state_version"
+      ],
+      "additionalProperties": false,
+      "description": "The shape is CLOSED. An unrecognised field is a 422 naming it, not silence: a client that misspells `state_version` would otherwise have its command applied at a version it never read, which is the concurrency guarantee removed by a typo.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "enum": [
+            "start",
+            "lease",
+            "complete",
+            "fail",
+            "cancel",
+            "expire"
+          ],
+          "description": "Every member of `CommandKind`, which is exactly the set that does NOT 422 as an unknown command. Being in this list is not a promise that the reducer accepts it against a given stage run: `start` against a pending stage run, for instance, reaches the lease check and is refused `lease_not_held`. A `kind` outside the list is a malformed request -- the engine never understood a command at all -- and is distinct from a refusal.",
+          "$comment": "Mirrors shepherd_workflow.commands.CommandKind."
+        },
+        "state_version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The version the caller READ. Not optional and not defaulted: a command that does not state the version it is acting on cannot be refused for acting on a stale one."
+        },
+        "fence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "default": null,
+          "description": "The fence granted by the lease this caller holds. Required in practice for `complete` and `fail`, which are refused with `lease_not_held` or `stale_fence` without the current one. Null for `lease`, `cancel` and `expire`."
+        },
+        "payload": {
+          "type": "object",
+          "default": {},
+          "description": "Per-command fields the reducer reads: `payload_digest` and `provider_pin` on `complete`, `dispatch_key` on `lease`, `reason` on `fail`. Never `job_id`, `stage_key` or `workflow_digest` -- those come from the stored stage run, because a caller restating them can only ever restate them wrongly.",
+          "properties": {
+            "payload_digest": {
+              "type": "string",
+              "minLength": 1
+            },
+            "provider_pin": {
+              "type": "string",
+              "minLength": 1
+            },
+            "dispatch_key": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "refusal": {
+      "type": "object",
+      "required": [
+        "status",
+        "detail"
+      ],
+      "additionalProperties": false,
+      "description": "A refusal is an ANSWER: the engine understood the command and declined it. It is a 4xx naming the class, never a 5xx, because a caller that cannot tell a refusal from a failure cannot tell whether retrying is correct.",
+      "properties": {
+        "status": {
+          "type": "integer",
+          "enum": [
+            404,
+            409,
+            422
+          ],
+          "description": "404 when the stage run is not visible to this caller, which covers 'no such id' AND 'another org's id' -- see the tenancy row in contract.md. 409 when the ledger moved and re-reading then retrying is correct. 422 when retrying the command unchanged will not make it applicable."
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "enum": [
+            "unknown_stage",
+            "workflow_digest_mismatch",
+            "terminal_state",
+            "stale_fence",
+            "state_version_conflict",
+            "lease_not_held",
+            "lease_expired",
+            "deadline_passed",
+            "feature_disabled",
+            "cancelled",
+            "dispatch_key_mismatch",
+            "lease_held",
+            "retry_not_due",
+            "attempts_exhausted"
+          ],
+          "description": "The refusal class VERBATIM. Match on this; it is the stable, machine-matchable half of the answer. The enum lists every member of `RefusalClass`, including ones no route in this slice has been shown to reach, so a class the package ADDS surfaces as a schema failure rather than as a silent new status code."
+        }
+      }
+    }
+  },
+  "required": [
+    "request",
+    "refusal"
+  ]
+}

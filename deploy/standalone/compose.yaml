@@ -1,0 +1,81 @@
+name: shepherd-workflow-printables-v1
+services:
+  workflow:
+    image: ${WORKFLOW_IMAGE:?Set an immutable repository@sha256 digest}
+    restart: unless-stopped
+    read_only: true
+    user: '65532:65532'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    ports:
+      - '127.0.0.1:${WORKFLOW_PORT:-18872}:8080'
+    environment:
+      SERVICE_ENV: production
+      PORT: '8080'
+      PYTHONDONTWRITEBYTECODE: '1'
+      DB_BACKEND: sqlite
+      DB_PATH: /var/lib/workflow/workflow.db
+      WORKFLOW_DEFINITION_PATH: /run/config/workflow.json
+      WORKFLOW_TABLE_PREFIX: printable_v1_
+      PRINCIPAL_ISSUER: ${WORKFLOW_ISSUER:?Set the trusted workload issuer}
+      AUTH_AUDIENCE: shepherd-workflow-printables
+      AUTH_JWKS_URI: http://jwks:8081/jwks.json
+    volumes:
+      - type: bind
+        source: ${WORKFLOW_DATA_DIR:?Set retained data directory}
+        target: /var/lib/workflow
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WORKFLOW_DEFINITION_FILE:?Set verified definition file}
+        target: /run/config/workflow.json
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      jwks:
+        condition: service_started
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16777216
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3).close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+  jwks:
+    image: ${WORKFLOW_IMAGE:?Set an immutable repository@sha256 digest}
+    entrypoint: [python, -m, http.server, '8081', --bind, 0.0.0.0, --directory, /run/public]
+    restart: unless-stopped
+    read_only: true
+    user: '65532:65532'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 32
+    ports:
+      - '127.0.0.1:18873:8081'
+    volumes:
+      - type: bind
+        source: ${WORKFLOW_JWKS_FILE:?Set trusted public JWKS file}
+        target: /run/public/jwks.json
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: '2'

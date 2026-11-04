@@ -1,0 +1,168 @@
+# CI/CD for foundry-workflow.
+#
+# Every job through `build` runs on every push -- no AWS credentials, no spend.
+# `deploy-dev` runs ONLY on an explicit `workflow_dispatch`, matching this
+# estate's rule that no agent or pipeline triggers a deploy automatically, and
+# it is gated a second time by a GitHub environment protection rule.
+#
+# `new_service.sh` emits this file into every service it creates, with the
+# service name above renamed by the same pass that renames the Python module --
+# so a service with its own extra deploy-time grant (for example an LLM
+# gateway's MODEL_MODE/ALLOWED_MODELS/BEDROCK_MODEL_ARNS)
+# adds those env vars and the matching `scripts/check_service_iac.sh` arm
+# itself; this file only carries what every emitted service needs.
+#
+# If the account this repo deploys to has its Actions billing blocked, every
+# run fails in seconds before a step executes regardless of what this file
+# says -- check the account's own billing status before reading a red run here
+# as a regression in the service.
+
+name: foundry-workflow
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Environment to deploy to (dev/staging/prod)"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, staging, prod]
+
+jobs:
+  gate:
+    name: lint + test (no AWS, no spend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install -e ".[aws,jwt,mysql,dev]"
+          pip install ruff pytest
+
+      - name: Lint
+        run: . .venv/bin/activate && ruff check src tests
+
+      - name: Test (full suite, void-check the count)
+        run: |
+          . .venv/bin/activate
+          # DO NOT add -q (or -qq, or --no-header) to either pytest call below.
+          # Both steps PARSE pytest's summary lines -- 'N tests collected' and
+          # 'N passed' -- and a verbosity flag suppresses exactly those lines, at
+          # exit 0, with a command that reads fine in review. The captured value
+          # then comes back empty and the guard below turns a green suite red.
+          #
+          # This comment previously gave a DIFFERENT reason: that pyproject's
+          # addopts already supplies a -q and flags ACCUMULATE into an effective
+          # -qq. That reason is false in this repository and was inherited from
+          # the service template. Measured 2026-09-05: there
+          # is no addopts here at all -- pyproject.toml contains zero, and
+          # pytest.ini, setup.cfg and tox.ini do not exist (positive control:
+          # [tool.ruff] matches once in the same pyproject.toml, so the
+          # instrument was reading the file).
+          #
+          # The distinction matters because the two reasons imply opposite
+          # actions. Under the old comment, an author who checked pyproject and
+          # found no addopts would conclude the hazard had been removed and that
+          # adding -q was now safe. It is not: the parsing constraint is
+          # unconditional and belongs to these steps, not to any config file.
+          collected=$(python -m pytest tests --collect-only | grep -oE '[0-9]+ tests? collected' | grep -oE '^[0-9]+')
+          if [ -z "$collected" ] || [ "$collected" -lt 1 ]; then
+            echo "gate: collected '$collected' tests -- a zero-collection run exits 0 and looks green"
+            exit 1
+          fi
+          python -m pytest tests --tb=short | tee /tmp/pytest.log
+          passed=$(grep -oE '[0-9]+ passed' /tmp/pytest.log | tail -1 | grep -oE '^[0-9]+')
+          if [ -z "$passed" ]; then
+            echo "gate: no passing summary line -- treating as failure"
+            exit 1
+          fi
+          echo "gate: $passed passed of $collected collected"
+
+  iac:
+    name: terraform validate + serverless print (no AWS, no spend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      # One script, not a list of inline steps, so the identical arms run here
+      # and locally.
+      - name: Validate this service's IaC
+        run: bash scripts/check_service_iac.sh
+
+  build:
+    name: build image, tag by commit sha
+    needs: [gate, iac]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tag
+        run: echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build (no push -- ECR push needs deploy-gated credentials)
+        run: docker build -f Dockerfile -t foundry-workflow:${{ steps.tag.outputs.image_tag }} .
+
+  deploy-dev:
+    name: push to ECR + deploy (manual dispatch only)
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_environment }} # protection rule gates this job on manual approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag by digest, push
+        id: push
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/foundry-workflow:${{ needs.build.outputs.image_tag }}"
+          docker build -f Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "image_uri=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Lambda (serverless)
+        # `working-directory` is not tidiness: the Serverless Framework REFUSES a
+        # config that is not in the working directory. `scripts/check_service_iac.sh`
+        # arm 7 pins this, because the failure would otherwise surface AFTER the
+        # image was built and pushed.
+        working-directory: iac
+        env:
+          IMAGE_URI: ${{ steps.push.outputs.image_uri }}
+          SQS_QUEUE_URL: ${{ vars.SQS_QUEUE_URL }}
+          SQS_QUEUE_ARN: ${{ vars.SQS_QUEUE_ARN }}
+        run: npx --yes serverless@3 deploy --stage ${{ inputs.target_environment }} --config serverless.yml
+
+      - name: Smoke (one success, one expected denial)
+        run: |
+          echo "placeholder -- real smoke hits the deployed URL for a 200 AND a deliberate 401/404;"
+          echo "a smoke that only checks the positive path is a documented anti-pattern in this estate"
+
+      - name: Rollback on red smoke
+        if: failure()
+        run: echo "placeholder -- point Lambda back at the previous image digest"

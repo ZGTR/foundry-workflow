@@ -1,0 +1,189 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shepherd.zgtr/blackbox/workflow-ledger/stage_run.v1.json",
+  "title": "workflow-ledger stage run v1",
+  "description": "The stage run as a caller sees it, plus the envelopes this service answers with when it will not return one. Served by `schemas/workflow.py`: `JobStartRequest` and `StageRunResponse`, and by `app_factory._STATUS_BY_ERROR`.",
+  "type": "object",
+  "properties": {
+    "start_job_request": {
+      "type": "object",
+      "required": [
+        "job_id",
+        "input_digest"
+      ],
+      "additionalProperties": false,
+      "description": "`POST /v1/jobs`. No `org_id`: the org comes from the authenticated principal (`CallerPrincipalV1.org_id`), never from the body, so a caller cannot start work in another tenant's ledger by naming it.",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "The caller's own id for the job. Half of the dispatch key."
+        },
+        "input_digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "A digest of the input this job runs over. The other half of the dispatch key: two starts of the same job over the same input are the same work, and return the same stage run rather than creating a second one."
+        }
+      }
+    },
+    "stage_run": {
+      "type": "object",
+      "required": [
+        "stage_run_id",
+        "job_id",
+        "workflow",
+        "stage",
+        "status",
+        "state_version",
+        "fence",
+        "attempts"
+      ],
+      "additionalProperties": false,
+      "description": "The single response shape for all three routes: `POST /v1/jobs` (201), `POST /v1/stage-runs/{id}/commands` (200) and `GET /v1/stage-runs/{id}` (200). Reading a stage run back after a command returns exactly what the command returned.",
+      "properties": {
+        "stage_run_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Derived from the dispatch key, not random. Two callers racing on a cold job derive the same id, which is why the database can resolve the race instead of the application."
+        },
+        "job_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workflow": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The workflow key this deployment runs, e.g. `shepherd.agent_run.v1`. A command naming a different workflow's digest is refused, not adapted."
+        },
+        "stage": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The stage key within that workflow, e.g. `plan`."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "leased",
+            "succeeded",
+            "review_wait",
+            "failed",
+            "cancelled",
+            "expired",
+            "retry_wait"
+          ],
+          "description": "The ledger's own status vocabulary (`shepherd_workflow.state.StageStatus`). Note which of these are TERMINAL, because it is not the obvious set: `review_wait`, `failed`, `cancelled` and `expired` are, and `succeeded` is NOT -- a succeeded stage is how the job reaches its next stage, so it is still a live row, while `review_wait` is where a run stops and waits for a human. Any command against a terminal stage run is refused with `terminal_state`."
+        },
+        "state_version": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The version this response reflects. A caller that wants to submit a command must state the version it read; this is that value. It is the whole concurrency guarantee, so it is never optional and never defaulted."
+        },
+        "fence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "The lease fence, or null when no lease has been granted. Exposed for one reason: a worker granted a lease must echo the fence it was granted, or its late write would be indistinguishable from a current one. Expiry decides when work may be handed out again; the fence decides whose write counts."
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The ledger's own attempt-row count, not a lease count. A freshly started stage run reads 1 before any lease exists, and each granted lease adds one, so the first leased stage run reads 2. Measured, because \"one per lease\" is the plausible reading and it is wrong by one."
+        },
+        "artifact_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next_stage_run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next_attempt_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lease_expires_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_digest": {
+          "type": "string"
+        },
+        "input_digest": {
+          "type": "string"
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "detail"
+      ],
+      "additionalProperties": false,
+      "description": "This service's own error envelope, produced by the single exception table in `app_factory._STATUS_BY_ERROR`. Carries 401 (unauthenticated), 404 (no such stage run, for you), 409 (a refusal: re-read and retry), 422 (a refusal that retrying unchanged will not fix, and an unknown command kind) and 500 (a failure of this service). On a 409, `detail` is the refusal class VERBATIM -- `state_version_conflict`, `stale_fence`, `lease_expired` -- because an operator triaging one needs the class, not a paraphrase.",
+      "properties": {
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "validation_error": {
+      "type": "object",
+      "required": [
+        "detail"
+      ],
+      "additionalProperties": false,
+      "description": "FastAPI's request-validation envelope, returned as 422 when the BODY is malformed. `detail` is a LIST here, not a string. Both shapes really do arrive as 422 -- a refused command carries the `error` shape above, a malformed body carries this one -- so a caller that parses a 422 `detail` as a string breaks on the first mistyped field. They are separate shapes in this contract on purpose.",
+      "properties": {
+        "detail": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "type",
+              "loc",
+              "msg"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "loc": {
+                "type": "array"
+              },
+              "msg": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "start_job_request",
+    "stage_run",
+    "error",
+    "validation_error"
+  ]
+}

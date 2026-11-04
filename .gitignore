@@ -1,0 +1,44 @@
+# An EMITTED service is its own repository, and nothing above it ignores anything.
+#
+# Inside the original monorepo its root `.gitignore` covers these paths, so the
+# absence of this file was invisible here -- and every service emitted by
+# `scripts/new_service.sh` started DIRTY the first time anyone ran its tests.
+# That is not cosmetic in this estate: the contract proof refuses a dirty tree,
+# so a fresh service's own suite would refuse to run on a checkout whose only
+# sin was having been run once. Measured 2026-09-05 on the three wave-1 repos:
+# 17 untracked `__pycache__/` entries each, immediately after `pytest`.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local virtualenvs and build output.
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Terraform working state. `.terraform.lock.hcl` is TRACKED on purpose -- it is
+# the supply-chain pin CI verifies against -- but the provider cache and any
+# state or tfvars are not.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# Serverless Framework build output.
+.serverless/
+node_modules/
+
+# The service's own local database, when it runs on the SQLite backend.
+*.db
+
+# The knowledge graph is a local, regenerable index, ignored at the monorepo root
+# (.gitignore:18) but NOT here -- and a submodule inherits nothing from the repo
+# above it. Without this line `graphify-repo-init.sh` leaves the service checkout
+# permanently untracked-dirty, and this estate's contract proof refuses a dirty tree.
+graphify-out/

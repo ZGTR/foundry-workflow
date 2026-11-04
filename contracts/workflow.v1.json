@@ -1,0 +1,20 @@
+{
+  "workflow_key": "shepherd.agent_run.v1",
+  "stages": [
+    {
+      "key": "plan",
+      "input_schema": "shepherd.agent_run.plan.request.v1",
+      "output_schema": "shepherd.agent_run.plan.result.v1"
+    },
+    {
+      "key": "execute",
+      "input_schema": "shepherd.agent_run.execute.request.v1",
+      "output_schema": "shepherd.agent_run.execute.result.v1"
+    },
+    {
+      "key": "review",
+      "input_schema": "shepherd.agent_run.review.request.v1",
+      "output_schema": "shepherd.agent_run.review.result.v1"
+    }
+  ]
+}
