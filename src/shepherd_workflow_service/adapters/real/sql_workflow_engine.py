@@ -52,7 +52,7 @@ from shepherd_workflow_service.models.workflow_command import build_command, to_
 from shepherd_workflow_service.ports.workflow_engine import CommandOutcome, StageRunView
 
 
-class _Refused(Exception):  # noqa: N818 -- not an error; a rollback signal
+class _Refused(StageRunConflict):  # noqa: N818 -- not an error; a rollback signal
     """Carries a refusal out of the transaction block so the transaction rolls back."""
 
     def __init__(self, refusal: str) -> None:
@@ -101,7 +101,7 @@ class SqlWorkflowEngine:
             self._engine = create_engine(self._url_provider(), future=True)
         return self._engine
 
-    def _connect(self) -> Connection:
+    def open_connection(self) -> Connection:
         engine = self._sql_engine()
         connection = engine.connect()
         if not self._schema_ready:
@@ -135,30 +135,11 @@ class SqlWorkflowEngine:
         stage = workflow.first
         key = derive_dispatch_key(workflow.digest, job_id, stage.key, input_digest)
         stage_run_id = derive_id("srun", key)
-        now = self._clock.now()
-
-        with self._connect() as connection:
+        with self.open_connection() as connection:
             try:
                 with connection.begin():
-                    self._insert_job(connection, job_id, principal, now)
-                    runs = self._tables["stage_runs"]
-                    first = connection.execute(
-                        select(runs.c.input_digest).where(
-                            runs.c.job_id == job_id, runs.c.stage_key == stage.key
-                        )
-                    ).scalar_one_or_none()
-                    if first is not None and first != input_digest:
-                        raise StageRunConflict("job_identity_conflict")
-                    self._insert_stage_run(
-                        connection,
-                        stage_run_id=stage_run_id,
-                        job_id=job_id,
-                        stage_key=stage.key,
-                        workflow_digest=workflow.digest,
-                        dispatch_key=key,
-                        input_digest=input_digest,
-                        principal=principal,
-                        now=now,
+                    self.start_in_transaction(
+                        connection, job_id=job_id, input_digest=input_digest, principal=principal
                     )
             except IntegrityError:
                 # The UNIQUE index on dispatch_key already held this work. Two API
@@ -167,9 +148,43 @@ class SqlWorkflowEngine:
                 pass
             if self._org_of(connection, stage_run_id) != principal.org_id:
                 raise StageRunConflict("job_identity_conflict")
-            view = self._view(connection, stage_run_id)
+            view = self.view_in_transaction(connection, stage_run_id)
         assert view is not None  # inserted above, or already present by dispatch key
         return view
+
+    @property
+    def tables(self):
+        """SQL integration boundary; callers must share the ledger transaction."""
+        return self._tables
+
+    def start_in_transaction(self, connection, *, job_id, input_digest, principal):
+        principal.require("jobs:write")
+        workflow = self.workflow
+        stage = workflow.first
+        key = derive_dispatch_key(workflow.digest, job_id, stage.key, input_digest)
+        stage_run_id = derive_id("srun", key)
+        now = self._clock.now()
+        self._insert_job(connection, job_id, principal, now)
+        runs = self._tables["stage_runs"]
+        first = connection.execute(
+            select(runs.c.input_digest).where(
+                runs.c.job_id == job_id, runs.c.stage_key == stage.key
+            )
+        ).scalar_one_or_none()
+        if first is not None and first != input_digest:
+            raise StageRunConflict("job_identity_conflict")
+        self._insert_stage_run(
+            connection,
+            stage_run_id=stage_run_id,
+            job_id=job_id,
+            stage_key=stage.key,
+            workflow_digest=workflow.digest,
+            dispatch_key=key,
+            input_digest=input_digest,
+            principal=principal,
+            now=now,
+        )
+        return stage_run_id
 
     def submit(
         self,
@@ -182,10 +197,10 @@ class SqlWorkflowEngine:
         principal: CallerPrincipalV1,
     ) -> CommandOutcome:
         refusal: str | None = None
-        with self._connect() as connection:
+        with self.open_connection() as connection:
             try:
                 with connection.begin():
-                    self._apply(
+                    self.apply_in_transaction(
                         connection,
                         stage_run_id=stage_run_id,
                         kind=kind,
@@ -203,23 +218,23 @@ class SqlWorkflowEngine:
                 # because from the caller's side they are the same situation.
                 refusal = str(RefusalClass.STATE_VERSION_CONFLICT)
             view = (
-                self._view(connection, stage_run_id)
+                self.view_in_transaction(connection, stage_run_id)
                 if self._org_of(connection, stage_run_id) == principal.org_id
                 else None
             )
         return CommandOutcome(refusal is None, refusal, view)
 
     def get(self, stage_run_id: str, *, principal: CallerPrincipalV1) -> StageRunView | None:
-        with self._connect() as connection:
+        with self.open_connection() as connection:
             if self._org_of(connection, stage_run_id) != principal.org_id:
                 # Absent and not-yours answer the same, on purpose: a stage run id
                 # is derived from a dispatch key, so a distinguishable answer would
                 # let one tenant enumerate another's jobs without reading one.
                 return None
-            return self._view(connection, stage_run_id)
+            return self.view_in_transaction(connection, stage_run_id)
 
     def stages(self, job_id: str, *, principal: CallerPrincipalV1) -> list[StageRunView]:
-        with self._connect() as connection:
+        with self.open_connection() as connection:
             table = self._tables["stage_runs"]
             ids = (
                 connection.execute(
@@ -230,12 +245,22 @@ class SqlWorkflowEngine:
                 .scalars()
                 .all()
             )
-            views = [self._view(connection, stage_id) for stage_id in ids]
-        order = {stage.key: index for index, stage in enumerate(self.workflow.stages)}
-        return sorted(
-            (view for view in views if view is not None),
-            key=lambda view: order.get(view.stage, len(order)),
-        )
+            views = [self.view_in_transaction(connection, stage_id) for stage_id in ids]
+        # Follow persisted successor links, not this process's default definition.
+        # This also orders jobs from other catalog entries and older pinned versions.
+        by_id = {view.stage_run_id: view for view in views if view is not None}
+        successors = {view.next_stage_run_id for view in by_id.values()}
+        roots = [key for key in by_id if key not in successors]
+        ordered = []
+        seen = set()
+        for root in roots + list(by_id):
+            key = root
+            while key in by_id and key not in seen:
+                seen.add(key)
+                view = by_id[key]
+                ordered.append(view)
+                key = view.next_stage_run_id
+        return ordered
 
     # -- LedgerOutboxDrain --------------------------------------------------
 
@@ -263,7 +288,7 @@ class SqlWorkflowEngine:
         """
         outbox = self._tables["outbox"]
         published = ambiguous = failed = 0
-        with self._connect() as connection:
+        with self.open_connection() as connection:
             # Read the tenant list in its OWN transaction and close it. A bare
             # SELECT autobegins one on this connection, and the per-org
             # `begin()` below would then raise rather than nest. A row written
@@ -292,7 +317,7 @@ class SqlWorkflowEngine:
 
     # -- internals ----------------------------------------------------------
 
-    def _apply(
+    def apply_in_transaction(
         self,
         connection: Connection,
         *,
@@ -332,6 +357,19 @@ class SqlWorkflowEngine:
         )
         if not result.accepted:
             raise _Refused(str(result.refusal))
+        if result.plan.next_stage_key is None and result.plan.next_status in {
+            StageStatus.SUCCEEDED,
+            StageStatus.REVIEW_WAIT,
+            StageStatus.FAILED,
+            StageStatus.EXPIRED,
+            StageStatus.CANCELLED,
+        }:
+            jobs = self._tables["jobs"]
+            connection.execute(
+                jobs.update()
+                .where(jobs.c.job_id == snapshot.job_id, jobs.c.org_id == principal.org_id)
+                .values(status=str(result.plan.next_status))
+            )
         if command.kind is CommandKind.LEASE:
             self._insert_attempt(connection, snapshot, principal)
         if result.plan.next_stage_key is not None:
@@ -442,7 +480,7 @@ class SqlWorkflowEngine:
             select(stage_runs.c.org_id).where(stage_runs.c.stage_run_id == stage_run_id)
         ).scalar_one_or_none()
 
-    def _view(self, connection: Connection, stage_run_id: str) -> StageRunView | None:
+    def view_in_transaction(self, connection: Connection, stage_run_id: str) -> StageRunView | None:
         snapshot = SqlAlchemyStageRepository(connection, self._tables).load(stage_run_id)
         if snapshot is None:
             return None

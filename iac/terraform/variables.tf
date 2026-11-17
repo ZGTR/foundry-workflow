@@ -47,6 +47,75 @@ variable "task_memory" {
 }
 
 variable "sqs_queue_arn" {
-  description = "The outbox relay's downstream queue"
+  description = "The legacy outbox relay downstream; unused for EventBridge execution."
   type        = string
+  default     = ""
+}
+
+variable "execution_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "workflow_catalog_path" {
+  type    = string
+  default = ""
+}
+
+variable "workflow_event_bus_name" {
+  type    = string
+  default = ""
+}
+
+variable "workflow_event_bus_arn" {
+  type    = string
+  default = ""
+}
+
+variable "workflow_event_tenants" {
+  type    = list(string)
+  default = []
+}
+
+variable "db_host" {
+  type    = string
+  default = ""
+}
+
+variable "db_port" {
+  type    = number
+  default = 3306
+}
+
+variable "db_name" {
+  type    = string
+  default = ""
+}
+
+variable "db_user" {
+  type    = string
+  default = ""
+}
+
+variable "db_password_secret_arn" {
+  type    = string
+  default = ""
+}
+
+variable "auth_jwks_uri" {
+  type    = string
+  default = ""
+}
+
+variable "auth_audience" {
+  type    = string
+  default = ""
+}
+
+variable "execution_subscriptions" {
+  type = map(object({
+    source_bus_name = string
+    event_pattern   = string
+  }))
+  default = {}
 }

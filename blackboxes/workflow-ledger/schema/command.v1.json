@@ -24,7 +24,8 @@
             "complete",
             "fail",
             "cancel",
-            "expire"
+            "expire",
+            "timeout"
           ],
           "description": "Every member of `CommandKind`, which is exactly the set that does NOT 422 as an unknown command. Being in this list is not a promise that the reducer accepts it against a given stage run: `start` against a pending stage run, for instance, reaches the lease check and is refused `lease_not_held`. A `kind` outside the list is a malformed request -- the engine never understood a command at all -- and is distinct from a refusal.",
           "$comment": "Mirrors shepherd_workflow.commands.CommandKind."

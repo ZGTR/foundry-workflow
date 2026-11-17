@@ -77,14 +77,14 @@ resource "aws_ecs_task_definition" "this" {
       portMappings = [
         { containerPort = 8080, protocol = "tcp" }
       ]
-      environment = [
+      environment = concat(var.execution_enabled ? local.execution_environment : [], [
         { name = "SERVICE_ENV", value = var.environment },
         { name = "PRINCIPAL_ISSUER", value = "foundry-workflow" },
         # EVENT_BUS_MODE deliberately absent -- see the note in serverless.yml:
         # SQS_QUEUE_URL, not this variable, selects the ledger
         # drain's downstream, and no composition root reads config.event_bus_mode.
         { name = "PORT", value = "8080" },
-      ]
+      ])
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -230,8 +230,9 @@ resource "aws_iam_role" "task" {
 }
 
 resource "aws_iam_role_policy" "task_sqs" {
-  name = "outbox-publish"
-  role = aws_iam_role.task.id
+  count = var.sqs_queue_arn != "" ? 1 : 0
+  name  = "outbox-publish"
+  role  = aws_iam_role.task.id
 
   policy = jsonencode({
     Version = "2012-10-17"

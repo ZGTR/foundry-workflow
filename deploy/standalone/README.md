@@ -34,7 +34,7 @@ Run the isolated container probe with the built image and the application's exac
   --receipt "$HOME/workflow-proofs/run-1/durability.json"
 ```
 
-The probe resolves the image ID before starting, creates uniquely named Docker resources, keeps signing keys in memory, and removes only its own containers, volumes and network afterward. It places public JWKS files under the host home directory because Colima does not share macOS `/var/folders` temporary directories. It rereads the published port after restart because Docker can assign a different ephemeral port. The receipt records the image, probe and definition hashes. Existing receipts cannot be overwritten.
+The probe resolves the image ID before starting, creates uniquely named Docker resources, keeps signing keys in memory, and removes only its own containers, volumes and network afterward. It copies public JWKS and workflow configuration into an isolated Docker volume, so the daemon does not need access to host bind paths. It rereads the published port after restart because Docker can assign a different ephemeral port. The receipt records the image, probe and definition hashes. Existing receipts cannot be overwritten.
 
 These are local container checks. A production deployment, its database integration and real application jobs need their own release evidence.
 

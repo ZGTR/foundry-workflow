@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Correlation": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Job Id",
+          "type": "string"
+        },
+        "stage_run_id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Stage Run Id",
+          "type": "string"
+        },
+        "workflow_digest": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Workflow Digest",
+          "type": "string"
+        },
+        "fence": {
+          "minimum": 1,
+          "title": "Fence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "job_id",
+        "stage_run_id",
+        "workflow_digest",
+        "fence"
+      ],
+      "title": "Correlation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "specversion": {
+      "const": "workflow.event/v1",
+      "default": "workflow.event/v1",
+      "title": "Specversion",
+      "type": "string"
+    },
+    "event_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Event Id",
+      "type": "string"
+    },
+    "type": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Type",
+      "type": "string"
+    },
+    "producer": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Producer",
+      "type": "string"
+    },
+    "tenant_id": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Tenant Id",
+      "type": "string"
+    },
+    "occurred_at": {
+      "format": "date-time",
+      "title": "Occurred At",
+      "type": "string"
+    },
+    "expires_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Expires At"
+    },
+    "correlation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Correlation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "input_ref": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Input Ref"
+    },
+    "output_ref": {
+      "anyOf": [
+        {
+          "maxLength": 2048,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Output Ref"
+    },
+    "payload_digest": {
+      "anyOf": [
+        {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Payload Digest"
+    },
+    "retryable": {
+      "default": false,
+      "title": "Retryable",
+      "type": "boolean"
+    },
+    "data": {
+      "additionalProperties": true,
+      "title": "Data",
+      "type": "object"
+    }
+  },
+  "required": [
+    "event_id",
+    "type",
+    "producer",
+    "tenant_id",
+    "occurred_at"
+  ],
+  "title": "EventEnvelope",
+  "type": "object"
+}

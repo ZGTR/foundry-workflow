@@ -21,6 +21,7 @@ class CommandKind(StrEnum):
     LEASE = "lease"
     COMPLETE = "complete"
     FAIL = "fail"
+    TIMEOUT = "timeout"
     CANCEL = "cancel"
     EXPIRE = "expire"
 

@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Completion": {
+      "additionalProperties": false,
+      "properties": {
+        "success": {
+          "$ref": "#/$defs/EventSelector"
+        },
+        "failure": {
+          "$ref": "#/$defs/EventSelector"
+        },
+        "timeout_seconds": {
+          "default": 900,
+          "maximum": 86400,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "success",
+        "failure"
+      ],
+      "title": "Completion",
+      "type": "object"
+    },
+    "Definition": {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "foundry.workflow/v2",
+          "title": "Apiversion",
+          "type": "string"
+        },
+        "workflow_key": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Workflow Key",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "trigger": {
+          "$ref": "#/$defs/EventSelector"
+        },
+        "stages": {
+          "items": {
+            "$ref": "#/$defs/Stage"
+          },
+          "minItems": 1,
+          "title": "Stages",
+          "type": "array"
+        },
+        "completion": {
+          "default": "success",
+          "enum": [
+            "success",
+            "review"
+          ],
+          "title": "Completion",
+          "type": "string"
+        },
+        "deadline_seconds": {
+          "default": 3600,
+          "maximum": 604800,
+          "minimum": 1,
+          "title": "Deadline Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "workflow_key",
+        "version",
+        "trigger",
+        "stages"
+      ],
+      "title": "Definition",
+      "type": "object"
+    },
+    "Dispatch": {
+      "additionalProperties": false,
+      "properties": {
+        "event_type": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Event Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type"
+      ],
+      "title": "Dispatch",
+      "type": "object"
+    },
+    "EventSelector": {
+      "additionalProperties": false,
+      "properties": {
+        "event_type": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Event Type",
+          "type": "string"
+        },
+        "producer": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Producer",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type",
+        "producer"
+      ],
+      "title": "EventSelector",
+      "type": "object"
+    },
+    "Stage": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "input_schema": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Input Schema",
+          "type": "string"
+        },
+        "output_schema": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Output Schema",
+          "type": "string"
+        },
+        "dispatch": {
+          "$ref": "#/$defs/Dispatch"
+        },
+        "completion": {
+          "$ref": "#/$defs/Completion"
+        },
+        "max_attempts": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "retry_delay_seconds": {
+          "default": 30,
+          "maximum": 86400,
+          "minimum": 0,
+          "title": "Retry Delay Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key",
+        "input_schema",
+        "output_schema",
+        "dispatch",
+        "completion"
+      ],
+      "title": "Stage",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "workflows": {
+      "items": {
+        "$ref": "#/$defs/Definition"
+      },
+      "minItems": 1,
+      "title": "Workflows",
+      "type": "array"
+    }
+  },
+  "required": [
+    "workflows"
+  ],
+  "title": "Catalog",
+  "type": "object"
+}

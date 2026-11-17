@@ -28,12 +28,15 @@ class StageDefinitionV1:
     output_schema: str
     max_attempts: int = 1
     retry_delay_seconds: int = 1
+    timeout_seconds: int = 300
 
     def __post_init__(self) -> None:
         if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
         if type(self.retry_delay_seconds) is not int or self.retry_delay_seconds < 0:
             raise ValueError("retry_delay_seconds must be a non-negative integer")
+        if type(self.timeout_seconds) is not int or self.timeout_seconds < 1:
+            raise ValueError("timeout_seconds must be positive")
         for name in ("key", "input_schema", "output_schema"):
             if not getattr(self, name):
                 raise ValueError(f"StageDefinitionV1.{name} must be non-empty")
@@ -52,8 +55,12 @@ class WorkflowDefinitionV1:
 
     workflow_key: str
     stages: tuple[StageDefinitionV1, ...]
+    completion: str = "review"
+    contract_digest: str | None = None
 
     def __post_init__(self) -> None:
+        if self.completion not in {"review", "success"}:
+            raise ValueError("completion must be review or success")
         if not self.workflow_key:
             raise ValueError("WorkflowDefinitionV1.workflow_key must be non-empty")
         if not self.stages:
@@ -65,21 +72,21 @@ class WorkflowDefinitionV1:
 
     @property
     def digest(self) -> str:
-        return canonical_digest(
-            {
-                "workflow_key": self.workflow_key,
-                "stages": [
-                    {
-                        k: v
-                        for k, v in asdict(s).items()
-                        if k not in {"max_attempts", "retry_delay_seconds"}
-                    }
-                    if s.max_attempts == 1 and s.retry_delay_seconds == 1
-                    else asdict(s)
-                    for s in self.stages
-                ],
-            }
-        )
+        if self.contract_digest:
+            return self.contract_digest
+        stages = []
+        for stage in self.stages:
+            value = asdict(stage)
+            if stage.timeout_seconds == 300:
+                value.pop("timeout_seconds")
+            if stage.max_attempts == 1 and stage.retry_delay_seconds == 1:
+                value.pop("max_attempts")
+                value.pop("retry_delay_seconds")
+            stages.append(value)
+        value = {"workflow_key": self.workflow_key, "stages": stages}
+        if self.completion != "review":
+            value["completion"] = self.completion
+        return canonical_digest(value)
 
     @property
     def first(self) -> StageDefinitionV1:

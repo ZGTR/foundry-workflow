@@ -167,7 +167,14 @@ class SqlAlchemyOutbox:
             .all()
         )
         return [
-            {"key": r["key"], "event_class": r["event_class"], "payload": r["payload"]}
+            {
+                "key": r["key"],
+                "event_class": r["event_class"],
+                "payload": {
+                    "occurred_at": r["created_at"].replace(tzinfo=UTC).isoformat(),
+                    **r["payload"],
+                },
+            }
             for r in rows
         ]
 

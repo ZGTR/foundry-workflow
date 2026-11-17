@@ -124,7 +124,7 @@ def test_the_underlying_UPDATE_is_conditional_on_the_version_it_read(
     view = engine.start_job(job_id="job_1", input_digest="dig_1", principal=principal)
 
     plan = TransitionPlanV1(accepted=True, next_status=StageStatus.LEASED, next_fence=1)
-    with engine._connect() as connection:  # noqa: SLF001 -- driving the real wiring
+    with engine.open_connection() as connection:  # noqa: SLF001 -- driving the real wiring
         with connection.begin():
             repository = SqlAlchemyStageRepository(connection, engine._tables)  # noqa: SLF001
             snapshot_a = repository.load(view.stage_run_id)
@@ -191,7 +191,7 @@ def test_a_refusal_writes_nothing(tmp_path: Path) -> None:
     assert outcome.accepted is False
     assert outcome.refusal == "lease_not_held"
 
-    with engine._connect() as connection:  # noqa: SLF001
+    with engine.open_connection() as connection:  # noqa: SLF001
         rows = connection.execute(engine._tables["outbox"].select()).fetchall()  # noqa: SLF001
     assert rows == [], "a refused command enqueued events"
 
@@ -252,7 +252,7 @@ def test_the_tables_it_creates_are_the_tables_it_is_allowed_to_write(
     )
 
     assert outcome.accepted is True, f"prefix {prefix!r} was refused its own tables"
-    with engine._connect() as connection:  # noqa: SLF001
+    with engine.open_connection() as connection:  # noqa: SLF001
         names = {
             row[0]
             for row in connection.exec_driver_sql(

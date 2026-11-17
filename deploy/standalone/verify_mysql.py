@@ -86,6 +86,8 @@ def main():
                 time.sleep(1)
         raise RuntimeError("isolated MySQL readiness deadline exceeded")
 
+    clock = FrozenClock(datetime.now(UTC).replace(microsecond=0))
+
     def engine():
         return SqlWorkflowEngine(
             url_provider=lambda: URL.create(
@@ -97,7 +99,7 @@ def main():
                 database="workflow_probe",
             ).render_as_string(hide_password=False),
             workflow_provider=lambda: definition,
-            clock=FrozenClock(datetime.now(UTC)),
+            clock=clock,
             job_deadline=timedelta(hours=1),
             table_prefix="printable_mysql_",
         )
@@ -202,7 +204,7 @@ def main():
                 assert failed.view.status == "retry_wait"
                 early = command(ledger, failed.view, "lease")
                 assert not early.accepted and early.refusal == "retry_not_due"
-                time.sleep(stage_definition.retry_delay_seconds + 0.1)
+                clock.advance(stage_definition.retry_delay_seconds)
                 ledger = engine()
                 retained = ledger.get(pending.stage_run_id, principal=principal)
                 assert retained == failed.view

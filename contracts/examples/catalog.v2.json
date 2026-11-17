@@ -1,0 +1,23 @@
+{
+  "workflows": [{
+    "apiVersion": "foundry.workflow/v2",
+    "workflow_key": "example.generate",
+    "version": 1,
+    "trigger": {"event_type": "example.requested", "producer": "example-api"},
+    "completion": "success",
+    "deadline_seconds": 3600,
+    "stages": [{
+      "key": "generate",
+      "input_schema": "example.request.v1",
+      "output_schema": "example.result.v1",
+      "dispatch": {"event_type": "example.generate.requested"},
+      "completion": {
+        "success": {"event_type": "example.generate.succeeded", "producer": "example-worker"},
+        "failure": {"event_type": "example.generate.failed", "producer": "example-worker"},
+        "timeout_seconds": 900
+      },
+      "max_attempts": 3,
+      "retry_delay_seconds": 30
+    }]
+  }]
+}

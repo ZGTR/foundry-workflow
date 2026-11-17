@@ -163,3 +163,12 @@ Contributions are welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+## Declarative event execution
+
+A versioned JSON catalog can now bind product events to sequential workflows,
+dispatch external work through EventBridge, and receive success/failure over events
+or authenticated webhooks. The same ledger handles fenced attempts, durable retries
+and deadlines; a workflow can finish successfully or explicitly wait for review.
+See [the execution contract and deployment guide](docs/declarative-execution.md)
+and [the example catalog](contracts/examples/catalog.v2.json).
