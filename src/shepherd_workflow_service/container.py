@@ -28,10 +28,12 @@ from shepherd_workflow_service.adapters.real.readiness import EngineReadinessChe
 from shepherd_workflow_service.config import ServiceConfig
 from shepherd_workflow_service.ports.auth import PrincipalAuth
 from shepherd_workflow_service.ports.event_bus import Publisher
+from shepherd_workflow_service.ports.execution import ExecutionConsumer
 from shepherd_workflow_service.ports.ledger_outbox import LedgerOutboxDrain
 from shepherd_workflow_service.ports.readiness import ReadinessCheck
 from shepherd_workflow_service.ports.secrets import SecretsPort
 from shepherd_workflow_service.ports.workflow_engine import WorkflowEnginePort
+from shepherd_workflow_service.services.execution import ExecutionService
 from shepherd_workflow_service.services.workflow_service import WorkflowService
 
 #: The database backends this service knows how to build a URL for. ONE list,
@@ -64,6 +66,9 @@ class Container:
     #: builds under a `socket.socket` that raises.
     ledger_outbox: LedgerOutboxDrain
     ledger_broker_factory: Callable[[], Broker]
+
+    execution_service: ExecutionService | None = None
+    execution_consumer_factory: Callable[[], ExecutionConsumer] | None = None
 
     def authenticate(self, headers: Mapping[str, str]) -> CallerPrincipalV1:
         return self.principal_auth.authenticate(headers)
@@ -172,7 +177,14 @@ def build_container(
             "genuinely a local run."
         )
 
+    execution_service, consumer_factory = _build_execution(config, resolved_clock, resolved_secrets)
+    if execution_service is not None and readiness_check is None:
+        resolved_readiness = EngineReadinessCheck(
+            resolved_engine, validate=execution_service.repository.check_ready
+        )
     return Container(
+        execution_service=execution_service,
+        execution_consumer_factory=consumer_factory,
         config=config,
         clock=resolved_clock,
         publisher=resolved_publisher,
@@ -212,6 +224,14 @@ def _ledger_broker_factory(
 
         if publisher is not None:
             return PublisherBroker(publisher, clock=clock)
+        if config.workflow_event_bus:
+            import boto3
+
+            from shepherd_workflow_service.adapters.real.eventbridge_broker import EventBridgeBroker
+            return EventBridgeBroker(
+                client=boto3.client("events", region_name=config.aws_region),
+                bus_name=config.workflow_event_bus, producer=config.issuer, clock=clock,
+            )
         if not config.sqs_queue_url:
             raise ConfigurationError(
                 "the ledger outbox drain has no durable downstream: SQS_QUEUE_URL is unset. "
@@ -249,7 +269,7 @@ def _build_workflow_engine(
     _require_a_buildable_database(config, secrets)
 
     path = config.workflow_definition_path
-    if not path:
+    if not path and not config.workflow_catalog_path:
         raise ConfigurationError(
             "WORKFLOW_DEFINITION_PATH is not set, and this service has no built-in "
             "workflow. A default would accept jobs it can never advance: every command "
@@ -259,7 +279,10 @@ def _build_workflow_engine(
 
     return SqlWorkflowEngine(
         url_provider=lambda: _database_url(config, secrets),
-        workflow_provider=lambda: load_workflow_definition(path),
+        workflow_provider=lambda: (
+            _catalog_default(config.workflow_catalog_path) if config.workflow_catalog_path
+            else load_workflow_definition(path)
+        ),
         clock=clock,
         job_deadline=timedelta(seconds=config.workflow_job_deadline_seconds),
         # ONE value reaches both `build_tables(prefix=...)` and `owned_tables(...)`
@@ -350,3 +373,53 @@ def _database_url(config: ServiceConfig, secrets: SecretsPort | None) -> str:
         f"mysql+pymysql://{user}:{password}@{config.db_host}:{config.db_port}/"
         f"{config.db_name}?charset=utf8mb4"
     )
+
+
+def _catalog_default(path):
+    from shepherd_workflow_service.adapters.real.workflow_catalog import JsonWorkflowCatalog
+    return JsonWorkflowCatalog(path).load().workflows[0].ledger_definition()
+
+
+def _build_execution(config, clock, secrets):
+    if not config.workflow_catalog_path:
+        return None, None
+    from shepherd_workflow_service.adapters.real.queue_execution import QueueExecutionConsumer
+    from shepherd_workflow_service.adapters.real.sql_execution import SqlExecutionRepository
+    from shepherd_workflow_service.adapters.real.sql_workflow_engine import SqlWorkflowEngine
+    from shepherd_workflow_service.adapters.real.workflow_catalog import JsonWorkflowCatalog
+
+    catalog = JsonWorkflowCatalog(config.workflow_catalog_path)
+    engines = {}
+
+    def engine_factory(definition):
+        if definition.digest not in engines:
+            engines[definition.digest] = SqlWorkflowEngine(
+                url_provider=lambda: _database_url(config, secrets),
+                workflow_provider=definition.ledger_definition, clock=clock,
+                job_deadline=timedelta(seconds=definition.deadline_seconds),
+                table_prefix=config.workflow_table_prefix,
+            )
+        return engines[definition.digest]
+
+    repository = SqlExecutionRepository(
+        catalog=catalog, engine_factory=engine_factory, clock=clock,
+        prefix=config.workflow_table_prefix, producer=config.issuer,
+    )
+    service = ExecutionService(repository)
+
+    def consumer_factory():
+        if config.env not in LOCAL_ENVS and config.db_backend != "mysql":
+            raise ConfigurationError("deployed execution requires a shared MySQL ledger")
+        if not (config.workflow_ingress_queue_url and config.workflow_event_bus
+                and config.workflow_event_tenants):
+            raise ConfigurationError(
+                "execution worker requires ingress queue, event bus and allowed event tenants"
+            )
+        import boto3
+        return QueueExecutionConsumer(
+            client=boto3.client("sqs", region_name=config.aws_region),
+            queue_url=config.workflow_ingress_queue_url, service=service,
+            issuer=config.issuer, allowed_tenants=config.workflow_event_tenants,
+        )
+
+    return service, consumer_factory

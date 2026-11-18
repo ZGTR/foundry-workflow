@@ -113,7 +113,7 @@ sls_print() {
        IMAGE_URI="123456789012.dkr.ecr.eu-west-1.amazonaws.com/x@sha256:$(printf '0%.0s' {1..64})" \
        SQS_QUEUE_URL="https://sqs.eu-west-1.amazonaws.com/123456789012/q" \
        SQS_QUEUE_ARN="arn:aws:sqs:eu-west-1:123456789012:q" \
-       npx --yes serverless@3 print --config serverless.yml --stage dev > "$WORK/sls.out" 2>&1 )
+       npx --yes serverless@3 print --config serverless.yml --stage dev > "$WORK/sls.out" 2> "$WORK/sls.err" )
 }
 
 # ANCHORED on the `name:` KEY and on end-of-line. Two failures this shape avoids: an

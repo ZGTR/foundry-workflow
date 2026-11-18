@@ -42,6 +42,17 @@ def load_workflow_definition(path: str) -> WorkflowDefinitionV1:
         )
 
     try:
+        if set(raw) - {"workflow_key", "stages", "completion"}:
+            raise ValueError("unknown workflow fields")
+        for stage in raw["stages"]:
+            if set(stage) - {"key", "input_schema", "output_schema", "max_attempts",
+                             "retry_delay_seconds", "timeout_seconds"}:
+                raise ValueError("unknown stage fields")
+            for name in ("key", "input_schema", "output_schema"):
+                if not isinstance(stage.get(name), str):
+                    raise ValueError(f"{name} must be a string")
+        if not isinstance(raw["workflow_key"], str):
+            raise ValueError("workflow_key must be a string")
         stages = tuple(
             StageDefinitionV1(
                 key=stage["key"],
@@ -49,10 +60,12 @@ def load_workflow_definition(path: str) -> WorkflowDefinitionV1:
                 output_schema=stage["output_schema"],
                 max_attempts=stage.get("max_attempts", 1),
                 retry_delay_seconds=stage.get("retry_delay_seconds", 1),
+                timeout_seconds=stage.get("timeout_seconds", 300),
             )
             for stage in raw["stages"]
         )
-        return WorkflowDefinitionV1(workflow_key=raw["workflow_key"], stages=stages)
+        return WorkflowDefinitionV1(workflow_key=raw["workflow_key"], stages=stages,
+                                    completion=raw.get("completion", "review"))
     except (KeyError, TypeError, ValueError) as exc:
         # ValueError covers the definition's own validation -- duplicate stage
         # keys, an empty stage list, an empty schema name. Re-raised as a

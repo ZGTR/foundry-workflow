@@ -46,7 +46,7 @@ def main():
     definition_bytes = definition.read_bytes()
     definition_sha256 = hashlib.sha256(definition_bytes).hexdigest()
     name = "wf-probe-proof-" + uuid4().hex[:10]
-    volumes = [name + "-data", name + "-restore"]
+    volumes = [name + "-data", name + "-restore", name + "-config"]
     containers = []
     private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     public = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private.public_key()))
@@ -91,6 +91,10 @@ def main():
             container,
             "--network",
             name,
+            "--env",
+            f"NO_PROXY={name}-jwks,localhost,127.0.0.1",
+            "--env",
+            f"no_proxy={name}-jwks,localhost,127.0.0.1",
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
@@ -104,13 +108,13 @@ def main():
             "-v",
             volume + ":/data",
             "-v",
-            str(definition) + ":/run/workflow.json:ro",
+            volumes[2] + ":/run/workflow-config:ro",
             "-e",
             "SERVICE_ENV=production",
             "-e",
             "DB_PATH=/data/workflow.db",
             "-e",
-            "WORKFLOW_DEFINITION_PATH=/run/workflow.json",
+            "WORKFLOW_DEFINITION_PATH=/run/workflow-config/workflow.json",
             "-e",
             "WORKFLOW_TABLE_PREFIX=printable_probe_",
             "-e",
@@ -148,7 +152,7 @@ def main():
                 "-c",
                 "chown 65532:65532 /data; chmod 700 /data",
             )
-        # Colima shares the home directory; macOS /var/folders is not a shared mount.
+        # Copy public configuration into a volume: works with local and remote Docker.
         with tempfile.TemporaryDirectory(prefix=name, dir=Path.home()) as temp:
             root = Path(temp)
             root.chmod(0o755)
@@ -159,6 +163,13 @@ def main():
             public_directory.mkdir(mode=0o755)
             (public_directory / "jwks.json").write_text(json.dumps({"keys": [public]}))
             (public_directory / "jwks.json").chmod(0o644)
+            writer = name + "-config-writer"
+            containers.append(writer)
+            docker("create", "--name", writer, "-v", volumes[2] + ":/config",
+                   "--entrypoint", "python", image_id, "-c", "pass")
+            docker("cp", str(definition), writer + ":/config/workflow.json")
+            docker("cp", str(public_directory / "jwks.json"), writer + ":/config/jwks.json")
+            docker("rm", writer)
             containers.append(name + "-jwks")
             docker(
                 "run",
@@ -171,7 +182,7 @@ def main():
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges",
                 "-v",
-                str(public_directory) + ":/public:ro",
+                volumes[2] + ":/public:ro",
                 "--entrypoint",
                 "python",
                 image_id,

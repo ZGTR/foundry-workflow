@@ -107,6 +107,10 @@ class StageRunner:
                 event_class=event_class,
                 payload={
                     "org_id": principal.org_id,
+                    "occurred_at": now.isoformat(),
+                    "workflow_digest": snapshot.workflow_digest,
+                    "fence": updated.fence,
+                    "state_version": updated.state_version,
                     "job_id": snapshot.job_id,
                     "stage_run_id": snapshot.stage_run_id,
                     "stage_key": snapshot.stage_key,

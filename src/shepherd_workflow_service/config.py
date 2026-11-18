@@ -71,6 +71,11 @@ class ServiceConfig:
     #: How long a stage run has before `EXPIRE` may be accepted against it.
     workflow_job_deadline_seconds: int = 3600
 
+    workflow_catalog_path: str | None = None
+    workflow_event_bus: str | None = None
+    workflow_ingress_queue_url: str | None = None
+    workflow_event_tenants: tuple[str, ...] = ()
+
     def __post_init__(self) -> None:
         if not self.env:
             raise ValueError("ServiceConfig.env must be non-empty")
@@ -136,6 +141,11 @@ class ServiceConfig:
             db_password_secret_id=os.environ.get("DB_PASSWORD_SECRET_ID"),
             workflow_table_prefix=os.environ.get("WORKFLOW_TABLE_PREFIX", DEFAULT_TABLE_PREFIX),
             workflow_definition_path=os.environ.get("WORKFLOW_DEFINITION_PATH"),
+            workflow_catalog_path=os.environ.get("WORKFLOW_CATALOG_PATH"),
+            workflow_event_bus=os.environ.get("WORKFLOW_EVENT_BUS"),
+            workflow_ingress_queue_url=os.environ.get("WORKFLOW_INGRESS_QUEUE_URL"),
+            workflow_event_tenants=tuple(filter(None,
+                os.environ.get("WORKFLOW_EVENT_TENANTS", "").split(","))),
             workflow_job_deadline_seconds=int(
                 os.environ.get("WORKFLOW_JOB_DEADLINE_SECONDS", "3600")
             ),

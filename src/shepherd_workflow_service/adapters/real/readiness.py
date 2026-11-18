@@ -39,11 +39,14 @@ _PROBE_PRINCIPAL = CallerPrincipalV1(
 
 
 class EngineReadinessCheck:
-    def __init__(self, engine: WorkflowEnginePort) -> None:
+    def __init__(self, engine: WorkflowEnginePort, validate=None) -> None:
         self._engine = engine
+        self._validate = validate
 
     def check(self) -> bool:
         try:
+            if self._validate is not None:
+                self._validate()
             self._engine.get(_PROBE_STAGE_RUN_ID, principal=_PROBE_PRINCIPAL)
         except Exception:  # noqa: BLE001 -- any failure means "not ready"
             return False

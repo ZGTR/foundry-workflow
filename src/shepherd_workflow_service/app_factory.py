@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from shepherd_contracts.errors import ConfigurationError, PolicyRefused, Unauthorized
 
 from shepherd_workflow_service.container import Container
-from shepherd_workflow_service.controllers import health, workflow
+from shepherd_workflow_service.controllers import execution, health, workflow
 from shepherd_workflow_service.errors import (
     StageRunConflict,
     StageRunNotFound,
@@ -38,6 +38,11 @@ def create_app(container: Container) -> FastAPI:
     app.include_router(
         workflow.build_router(container.workflow_service, container.authenticate)
     )
+
+    if container.execution_service is not None:
+        app.include_router(execution.build_router(
+            container.execution_service, container.authenticate
+        ))
 
     for error_type, status_code in _STATUS_BY_ERROR:
 

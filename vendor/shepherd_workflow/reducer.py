@@ -156,7 +156,11 @@ def reduce(
         return TransitionPlanV1(
             accepted=True,
             next_status=StageStatus.CANCELLED,
-            event_classes=("stage.cancelled",),
+            event_classes=(
+                ("stage.cancelled", "job.cancelled")
+                if workflow.contract_digest
+                else ("stage.cancelled",)
+            ),
         )
 
     if command.kind is CommandKind.EXPIRE:
@@ -165,7 +169,9 @@ def reduce(
         return TransitionPlanV1(
             accepted=True,
             next_status=StageStatus.EXPIRED,
-            event_classes=("stage.expired",),
+            event_classes=(
+                ("stage.expired", "job.expired") if workflow.contract_digest else ("stage.expired",)
+            ),
         )
 
     if now >= snapshot.deadline_at:
@@ -174,14 +180,28 @@ def reduce(
     if command.kind is CommandKind.LEASE:
         if (snapshot.fence or 0) >= stage.max_attempts:
             return TransitionPlanV1.refuse(RefusalClass.ATTEMPTS_EXHAUSTED)
-        return _lease(snapshot, command, now, lease_duration)
+        return _lease(
+            snapshot,
+            command,
+            now,
+            timedelta(seconds=stage.timeout_seconds)
+            if stage.timeout_seconds != 300
+            else lease_duration,
+        )
 
     # COMPLETE and FAIL both require the caller to still hold the lease.
-    held = _lease_check(snapshot, command, now)
+    if command.kind is CommandKind.TIMEOUT:
+        if snapshot.status != StageStatus.LEASED or command.fence != snapshot.fence:
+            return TransitionPlanV1.refuse(RefusalClass.STALE_FENCE)
+        if snapshot.lease_expires_at is None or now < snapshot.lease_expires_at:
+            return TransitionPlanV1.refuse(RefusalClass.LEASE_HELD)
+        held = None
+    else:
+        held = _lease_check(snapshot, command, now)
     if held is not None:
         return held
 
-    if command.kind is CommandKind.FAIL:
+    if command.kind in (CommandKind.FAIL, CommandKind.TIMEOUT):
         if command.retryable and (snapshot.fence or 0) < stage.max_attempts:
             return TransitionPlanV1(
                 accepted=True,
@@ -192,7 +212,9 @@ def reduce(
         return TransitionPlanV1(
             accepted=True,
             next_status=StageStatus.FAILED,
-            event_classes=("stage.failed",),
+            event_classes=(
+                ("stage.failed", "job.failed") if workflow.contract_digest else ("stage.failed",)
+            ),
         )
 
     if command.kind is CommandKind.COMPLETE:
@@ -228,7 +250,7 @@ def _lease(
         next_status=StageStatus.LEASED,
         event_classes=("stage.leased",),
         next_fence=(snapshot.fence or 0) + 1,
-        next_lease_expires_at=now + lease_duration,
+        next_lease_expires_at=min(snapshot.deadline_at, now + lease_duration),
     )
 
 
@@ -262,8 +284,15 @@ def _complete(
     if nxt is None:
         return TransitionPlanV1(
             accepted=True,
-            next_status=StageStatus.REVIEW_WAIT,
-            event_classes=("stage.succeeded", "job.review_wait"),
+            next_status=(
+                StageStatus.REVIEW_WAIT
+                if workflow.completion == "review"
+                else StageStatus.SUCCEEDED
+            ),
+            event_classes=(
+                "stage.succeeded",
+                "job.review_wait" if workflow.completion == "review" else "job.succeeded",
+            ),
             artifact_digest=produced,
             output_ref=command.output_ref,
             provider_pin=command.provider_pin,
