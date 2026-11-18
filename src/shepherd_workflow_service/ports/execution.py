@@ -13,4 +13,6 @@ class ExecutionRepository(Protocol):
 
 
 class ExecutionConsumer(Protocol):
-    def poll(self) -> None: ...
+    def poll(self) -> int:
+        """Consume one batch and return the number of failed deliveries."""
+        ...

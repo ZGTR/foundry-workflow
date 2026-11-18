@@ -94,6 +94,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: ./.github/actions/comms-read
+        with:
+          app-id: ${{ vars.COMMS_READ_APP_ID }}
+          private-key: ${{ secrets.COMMS_READ_APP_PRIVATE_KEY }}
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
@@ -103,9 +108,25 @@ jobs:
       - name: Validate this service's IaC
         run: bash scripts/check_service_iac.sh
 
+  event-transport:
+    name: EventBridge + SQS recovery probe (local emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[aws,jwt,mysql,dev]" pytest
+      - run: docker pull localstack/localstack:3.8
+      - name: Two profiles, redelivery, restart, retry, timeout and DLQ replay
+        env:
+          PYTHONPATH: .:src:vendor
+        run: python -m pytest -v -s deploy/standalone/test_event_execution.py
+
   build:
     name: build image, tag by commit sha
-    needs: [gate, iac]
+    needs: [gate, iac, event-transport]
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.tag.outputs.image_tag }}

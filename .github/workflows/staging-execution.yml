@@ -1,0 +1,115 @@
+name: Staging execution rollout
+on:
+  workflow_dispatch:
+    inputs:
+      image_uri:
+        description: Immutable private ECR image URI (repository@sha256:digest)
+        required: true
+        type: string
+      apply:
+        description: Apply the generated plan and run read-only smoke checks
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: workflow-staging-deployment
+  cancel-in-progress: false
+jobs:
+  staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_STATE_LOCK_TABLE: ${{ vars.TF_STATE_LOCK_TABLE }}
+      IMAGE_URI: ${{ inputs.image_uri }}
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - uses: ./.github/actions/comms-read
+        with:
+          app-id: ${{ vars.COMMS_READ_APP_ID }}
+          private-key: ${{ secrets.COMMS_READ_APP_PRIVATE_KEY }}
+      - name: Check staging prerequisites
+        env:
+          CONFIG: ${{ vars.WORKFLOW_TFVARS_JSON }}
+          ROLE: ${{ secrets.DEPLOY_ROLE_ARN }}
+          SERVICE_BASE_URL: ${{ vars.SERVICE_BASE_URL }}
+          SMOKE_BEARER_TOKEN: ${{ secrets.SMOKE_BEARER_TOKEN }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          test -n "$AWS_REGION" && test -n "$TF_STATE_BUCKET" && test -n "$TF_STATE_LOCK_TABLE"
+          test -n "$CONFIG" && test -n "$ROLE"
+          if [ "$APPLY" = true ]; then
+            test -n "$SERVICE_BASE_URL" && test -n "$SMOKE_BEARER_TOKEN"
+          fi
+          printf '%s' "$CONFIG" > /tmp/staging-config.json
+          python -m pip install -e .
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Extract catalog from immutable image and compile subscriptions
+        run: |
+          python - <<'PY'
+          import os, re
+          if not re.fullmatch(r'[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[^\s@]+@sha256:[0-9a-f]{64}', os.environ['IMAGE_URI']):
+              raise SystemExit('Use an immutable private ECR image URI')
+          PY
+          docker pull "$IMAGE_URI"
+          CATALOG=$(python -c 'import json; print(json.load(open("/tmp/staging-config.json"))["workflow_catalog_path"])')
+          container=$(docker create "$IMAGE_URI")
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:$CATALOG" /tmp/image-catalog.json
+          PYTHONPATH=src:vendor python scripts/prepare_execution_deployment.py \
+            --config /tmp/staging-config.json --catalog /tmp/image-catalog.json \
+            --image "$IMAGE_URI" --output /tmp/staging.tfvars.json
+      - name: Initialize isolated remote state
+        run: |
+          terraform -chdir=iac/terraform init -input=false -lockfile=readonly \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=foundry-workflow/staging/terraform.tfstate" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="dynamodb_table=$TF_STATE_LOCK_TABLE" \
+            -backend-config="encrypt=true"
+      - name: Plan exact image and catalog
+        run: |
+          terraform -chdir=iac/terraform validate
+          terraform -chdir=iac/terraform plan -input=false -lock-timeout=120s \
+            -var-file=/tmp/staging.tfvars.json -out=/tmp/staging.plan
+      - name: Apply saved plan
+        if: inputs.apply
+        run: terraform -chdir=iac/terraform apply -input=false /tmp/staging.plan
+      - name: Wait for API and worker
+        if: inputs.apply
+        run: |
+          cluster=$(terraform -chdir=iac/terraform output -raw ecs_cluster_name)
+          api=$(terraform -chdir=iac/terraform output -raw ecs_service_name)
+          worker=$(terraform -chdir=iac/terraform output -raw execution_service_name)
+          aws ecs wait services-stable --cluster "$cluster" --services "$api" "$worker"
+          # A rollback can also become stable. Require both services to run the planned revisions.
+          aws ecs describe-services --cluster "$cluster" --services "$api" "$worker" > /tmp/services.json
+          terraform -chdir=iac/terraform output -json execution_task_definitions > /tmp/expected.json
+          python - <<'PY'
+          import json
+          services = json.load(open('/tmp/services.json'))
+          expected = set(json.load(open('/tmp/expected.json')))
+          actual = {service['taskDefinition'] for service in services['services']}
+          if services.get('failures') or actual != expected:
+              raise SystemExit('ECS did not retain the planned task revisions (possible rollback)')
+          PY
+      - name: Read-only staging smoke
+        if: inputs.apply
+        env:
+          SERVICE_BASE_URL: ${{ vars.SERVICE_BASE_URL }}
+          SMOKE_BEARER_TOKEN: ${{ secrets.SMOKE_BEARER_TOKEN }}
+        run: printf '%s' "$SMOKE_BEARER_TOKEN" | python scripts/smoke_execution_api.py --base-url "$SERVICE_BASE_URL"

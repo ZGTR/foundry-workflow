@@ -1,29 +1,22 @@
-"""ECS worker: consume, recover due work, then drain the durable outbox."""
+"""ECS worker with independent intake, recovery, publishing and telemetry."""
 import logging
-
-from shepherd_contracts.errors import ConfigurationError
+import time
 
 from shepherd_workflow_service.config import ServiceConfig
-from shepherd_workflow_service.container import build_container
+from shepherd_workflow_service.container import build_container, build_execution_cycle
 
 logger = logging.getLogger(__name__)
 
 
 def main():
-    config = ServiceConfig.from_environment()
-    container = build_container(config)
-    if container.execution_consumer_factory is None or container.execution_service is None:
-        raise ConfigurationError("execution worker requires WORKFLOW_CATALOG_PATH")
-    consumer = container.execution_consumer_factory()
+    cycle = build_execution_cycle(build_container(ServiceConfig.from_environment()))
     while True:
         try:
-            consumer.poll()
-            container.execution_service.tick()
-            container.drain_ledger_outbox()
+            failures = cycle.run()
         except Exception:
-            # Polling uses long polling; failures back off without killing recovery forever.
-            logger.exception("Workflow execution cycle failed")
-            import time
+            logger.exception("Workflow cycle telemetry failed")
+            failures = 1
+        if failures:
             time.sleep(5)
 
 
