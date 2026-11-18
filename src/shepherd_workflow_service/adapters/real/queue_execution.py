@@ -25,6 +25,7 @@ class QueueExecutionConsumer:
             WaitTimeSeconds=10,
             MessageSystemAttributeNames=["ApproximateReceiveCount"],
         )
+        failures = 0
         for message in response.get("Messages", []):
             try:
                 wrapped = json.loads(message["Body"])
@@ -45,6 +46,7 @@ class QueueExecutionConsumer:
                     QueueUrl=self.queue_url, ReceiptHandle=message["ReceiptHandle"]
                 )
             except Exception:
+                failures += 1
                 logger.exception("Workflow message failed: %s", message["MessageId"])
                 count = int(message.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
                 waits = (30, 120, 600, 1800, 3600, 7200)
@@ -53,3 +55,4 @@ class QueueExecutionConsumer:
                     ReceiptHandle=message["ReceiptHandle"],
                     VisibilityTimeout=waits[min(count - 1, len(waits) - 1)],
                 )
+        return failures

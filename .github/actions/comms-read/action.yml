@@ -1,0 +1,42 @@
+name: Read private comms module
+description: Short-lived contents-read token scoped to the shared comms repository
+inputs:
+  app-id:
+    required: true
+    description: GitHub App ID installed on ZGTR/comms-eventing
+  private-key:
+    required: true
+    description: GitHub App private key
+runs:
+  using: composite
+  steps:
+    - name: Check credential configuration
+      shell: bash
+      env:
+        APP_ID: ${{ inputs.app-id }}
+        APP_KEY: ${{ inputs.private-key }}
+      run: |
+        if [ -z "$APP_ID" ] || [ -z "$APP_KEY" ]; then
+          echo '::error::Configure COMMS_READ_APP_ID and COMMS_READ_APP_PRIVATE_KEY for a GitHub App with contents:read on ZGTR/comms-eventing. Fork PRs require a trusted branch run.'
+          exit 1
+        fi
+    - uses: actions/create-github-app-token@v2
+      id: token
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ZGTR
+        repositories: comms-eventing
+        permission-contents: read
+    - name: Authorize Terraform module fetch
+      shell: bash
+      env:
+        MODULE_TOKEN: ${{ steps.token.outputs.token }}
+      run: |
+        header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$MODULE_TOKEN" | base64 -w0)"
+        echo "::add-mask::$header"
+        {
+          echo 'GIT_CONFIG_COUNT=1'
+          echo 'GIT_CONFIG_KEY_0=http.https://github.com/ZGTR/comms-eventing.git.extraheader'
+          echo "GIT_CONFIG_VALUE_0=$header"
+        } >> "$GITHUB_ENV"

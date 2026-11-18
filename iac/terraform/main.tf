@@ -49,6 +49,17 @@ data "aws_subnets" "private" {
   }
 }
 
+# The public ALB needs public subnets; API and worker tasks remain private.
+data "aws_subnets" "public" {
+  filter {
+    name   = "vpc-id"
+    values = [var.vpc_id]
+  }
+  tags = {
+    Tier = "public"
+  }
+}
+
 # --- ECS cluster + task + service -----------------------------------------
 
 resource "aws_ecs_cluster" "this" {
@@ -94,7 +105,7 @@ resource "aws_ecs_task_definition" "this" {
         }
       }
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:8080/healthz || exit 1"]
+        command     = ["CMD", "/opt/venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).close()"]
         interval    = 30
         timeout     = 5
         retries     = 3
@@ -110,6 +121,11 @@ resource "aws_ecs_service" "this" {
   task_definition = aws_ecs_task_definition.this.arn
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
+
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
   network_configuration {
     subnets          = data.aws_subnets.private.ids
@@ -171,7 +187,7 @@ resource "aws_lb" "this" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = data.aws_subnets.private.ids
+  subnets            = data.aws_subnets.public.ids
 }
 
 resource "aws_lb_target_group" "this" {

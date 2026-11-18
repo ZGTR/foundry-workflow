@@ -122,3 +122,6 @@ checks. The container and MySQL probes in deploy/standalone cover the original
 ledger's auth, durability and concurrency guarantees. Cloud deployment and an actual
 product executor remain separate release checks; local tests do not claim AWS
 delivery or downstream exactly-once side effects.
+
+Operational metrics, tenant-scoped history, recovery checks and the staged ECS rollout
+are documented in [operations.md](operations.md).

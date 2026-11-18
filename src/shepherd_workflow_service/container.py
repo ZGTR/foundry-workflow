@@ -30,6 +30,7 @@ from shepherd_workflow_service.ports.auth import PrincipalAuth
 from shepherd_workflow_service.ports.event_bus import Publisher
 from shepherd_workflow_service.ports.execution import ExecutionConsumer
 from shepherd_workflow_service.ports.ledger_outbox import LedgerOutboxDrain
+from shepherd_workflow_service.ports.observability import Observability
 from shepherd_workflow_service.ports.readiness import ReadinessCheck
 from shepherd_workflow_service.ports.secrets import SecretsPort
 from shepherd_workflow_service.ports.workflow_engine import WorkflowEnginePort
@@ -67,6 +68,7 @@ class Container:
     ledger_outbox: LedgerOutboxDrain
     ledger_broker_factory: Callable[[], Broker]
 
+    observations: Observability | None = None
     execution_service: ExecutionService | None = None
     execution_consumer_factory: Callable[[], ExecutionConsumer] | None = None
 
@@ -104,6 +106,7 @@ def build_container(
     secrets: SecretsPort | None = None,
     workflow_engine: WorkflowEnginePort | None = None,
     ledger_outbox: LedgerOutboxDrain | None = None,
+    observations: Observability | None = None,
 ) -> Container:
     """Wire the whole graph from `config`. Every port can be overridden, e.g.
     `build_container(config, clock=FrozenClock(...))` in a test.
@@ -182,7 +185,13 @@ def build_container(
         resolved_readiness = EngineReadinessCheck(
             resolved_engine, validate=execution_service.repository.check_ready
         )
+    from shepherd_workflow_service.adapters.real.sql_observability import SqlObservability
+    resolved_observations = observations if observations is not None else (
+        SqlObservability(resolved_engine, resolved_clock)
+        if execution_service is not None else None
+    )
     return Container(
+        observations=resolved_observations,
         execution_service=execution_service,
         execution_consumer_factory=consumer_factory,
         config=config,
@@ -423,3 +432,21 @@ def _build_execution(config, clock, secrets):
         )
 
     return service, consumer_factory
+
+
+def build_execution_cycle(container):
+    import sys
+
+    from shepherd_workflow_service.adapters.real.emf_metrics import EmfMetrics
+    from shepherd_workflow_service.services.execution_cycle import ExecutionCycle
+
+    if (container.execution_consumer_factory is None or container.execution_service is None
+            or container.observations is None):
+        raise ConfigurationError("execution worker requires WORKFLOW_CATALOG_PATH")
+    return ExecutionCycle(
+        consumer=container.execution_consumer_factory(),
+        service=container.execution_service, drain=container.drain_ledger_outbox,
+        observations=container.observations,
+        metrics=EmfMetrics(stream=sys.stdout, service=container.config.issuer,
+                          environment=container.config.env, clock=container.clock),
+    )

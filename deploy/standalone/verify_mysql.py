@@ -22,6 +22,7 @@ from verification_support import cleanup_docker, file_hashes, publish_receipt
 from shepherd_workflow_service.adapters.real.json_workflow_definition import (
     load_workflow_definition,
 )
+from shepherd_workflow_service.adapters.real.sql_observability import SqlObservability
 from shepherd_workflow_service.adapters.real.sql_workflow_engine import SqlWorkflowEngine
 
 
@@ -239,6 +240,11 @@ def main():
         assert exhausted.accepted and exhausted.view is not None
         assert exhausted.view.status == "failed"
         assert not command(ledger, exhausted.view, "lease").accepted
+        observations = SqlObservability(ledger, clock)
+        assert observations.metrics()["FailedStages"] == 1
+        assert observations.metrics()["RetryAttempts"] == 1
+        history = observations.history("mysql-durable", principal, 100)
+        assert history and all(row["stage_run_id"] for row in history)
         evidence = {
             "scope": "local-mysql-ledger-only",
             "image_id": image_id,
@@ -260,6 +266,7 @@ def main():
                 "single-attempt-source-refuses-retry",
                 "all-stages-finish-at-review-wait",
                 "completed-ledger-survives-mysql-restart",
+                "mysql-operational-metrics-and-tenant-history",
             ],
             "stages": [
                 {
