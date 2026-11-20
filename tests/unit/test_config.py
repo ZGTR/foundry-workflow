@@ -50,6 +50,18 @@ def test_from_environment_detects_lambda_by_ambient_variable(
     assert config.runtime_mode == "lambda"
 
 
+@pytest.mark.parametrize("setting", ["0", "604801", "1.5"])
+def test_queue_age_threshold_rejects_invalid_seconds(monkeypatch, setting):
+    monkeypatch.setenv("TENANT_QUEUE_AGE_SECONDS", setting)
+    with pytest.raises(ValueError):
+        ServiceConfig.from_environment()
+
+
+def test_queue_age_threshold_reads_operator_setting(monkeypatch):
+    monkeypatch.setenv("TENANT_QUEUE_AGE_SECONDS", "45")
+    assert ServiceConfig.from_environment().tenant_queue_age_seconds == 45
+
+
 def test_sqs_mode_requires_queue_url() -> None:
     with pytest.raises(ValueError, match="sqs_queue_url"):
         ServiceConfig(

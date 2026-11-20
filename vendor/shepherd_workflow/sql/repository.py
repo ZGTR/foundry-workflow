@@ -41,15 +41,14 @@ class SqlAlchemyStageRepository:
         self._c = connection
         self._stage_runs = tables["stage_runs"]
 
-    def load(self, stage_run_id: str) -> LedgerSnapshotV1 | None:
-        row = (
-            self._c.execute(
-                select(self._stage_runs).where(self._stage_runs.c.stage_run_id == stage_run_id)
-            )
-            .mappings()
-            .first()
-        )
-        return None if row is None else _to_snapshot(row)
+    def load(self, stage_run_id: str, *, org_id: str | None = None) -> LedgerSnapshotV1 | None:
+        query = select(self._stage_runs).where(self._stage_runs.c.stage_run_id == stage_run_id)
+        if org_id is not None:
+            query = query.where(self._stage_runs.c.org_id == org_id)
+        row = self._c.execute(query).mappings().first()
+        if row is None or (org_id is not None and row["org_id"] != org_id):
+            return None
+        return _to_snapshot(row)
 
     def apply(
         self,
@@ -106,7 +105,7 @@ class SqlAlchemyStageRepository:
                 f"{snapshot.stage_run_id} was not at version {snapshot.state_version} "
                 f"for org {principal.org_id}"
             )
-        updated = self.load(snapshot.stage_run_id)
+        updated = self.load(snapshot.stage_run_id, org_id=principal.org_id)
         assert updated is not None  # the UPDATE above matched, so the row exists
         return updated
 

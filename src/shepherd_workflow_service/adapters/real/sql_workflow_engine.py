@@ -40,10 +40,10 @@ from shepherd_workflow.sql.repository import (
     SqlAlchemyStageRepository,
     SqlAlchemyUnitOfWork,
 )
-from shepherd_workflow.sql.schema import build_tables
+from shepherd_workflow.sql.schema import build_tables, tenant_id_column_type
 from shepherd_workflow.state import RefusalClass, StageStatus
 from shepherd_workflow.workflow import WorkflowDefinitionV1
-from sqlalchemy import Engine, MetaData, create_engine, func, inspect, select
+from sqlalchemy import Column, Engine, MetaData, String, Table, create_engine, func, inspect, select
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
@@ -83,6 +83,12 @@ class SqlWorkflowEngine:
         self._prefix = table_prefix
         self._metadata = MetaData()
         self._tables = build_tables(self._metadata, prefix=table_prefix)
+        self._execution_bindings = Table(
+            table_prefix + "execution_bindings",
+            MetaData(),
+            Column("job_id", String(64), primary_key=True),
+            Column("org_id", tenant_id_column_type(), nullable=False),
+        )
         self._owned = owned_tables(table_prefix)
         self._engine: Engine | None = None
         self._workflow: WorkflowDefinitionV1 | None = None
@@ -138,6 +144,8 @@ class SqlWorkflowEngine:
         with self.open_connection() as connection:
             try:
                 with connection.begin():
+                    if self._has_execution_binding(connection, job_id, principal.org_id):
+                        raise StageRunConflict("managed_execution")
                     self.start_in_transaction(
                         connection, job_id=job_id, input_digest=input_digest, principal=principal
                     )
@@ -148,7 +156,7 @@ class SqlWorkflowEngine:
                 pass
             if self._org_of(connection, stage_run_id) != principal.org_id:
                 raise StageRunConflict("job_identity_conflict")
-            view = self.view_in_transaction(connection, stage_run_id)
+            view = self.view_in_transaction(connection, stage_run_id, org_id=principal.org_id)
         assert view is not None  # inserted above, or already present by dispatch key
         return view
 
@@ -200,6 +208,14 @@ class SqlWorkflowEngine:
         with self.open_connection() as connection:
             try:
                 with connection.begin():
+                    runs = self._tables["stage_runs"]
+                    job_id = connection.scalar(select(runs.c.job_id).where(
+                        runs.c.stage_run_id == stage_run_id, runs.c.org_id == principal.org_id
+                    ))
+                    if job_id is not None and self._has_execution_binding(
+                        connection, job_id, principal.org_id
+                    ):
+                        raise _Refused(str(RefusalClass.FEATURE_DISABLED))
                     self.apply_in_transaction(
                         connection,
                         stage_run_id=stage_run_id,
@@ -217,21 +233,12 @@ class SqlWorkflowEngine:
                 # same refusal the reducer gives a caller that read a stale row,
                 # because from the caller's side they are the same situation.
                 refusal = str(RefusalClass.STATE_VERSION_CONFLICT)
-            view = (
-                self.view_in_transaction(connection, stage_run_id)
-                if self._org_of(connection, stage_run_id) == principal.org_id
-                else None
-            )
+            view = self.view_in_transaction(connection, stage_run_id, org_id=principal.org_id)
         return CommandOutcome(refusal is None, refusal, view)
 
     def get(self, stage_run_id: str, *, principal: CallerPrincipalV1) -> StageRunView | None:
         with self.open_connection() as connection:
-            if self._org_of(connection, stage_run_id) != principal.org_id:
-                # Absent and not-yours answer the same, on purpose: a stage run id
-                # is derived from a dispatch key, so a distinguishable answer would
-                # let one tenant enumerate another's jobs without reading one.
-                return None
-            return self.view_in_transaction(connection, stage_run_id)
+            return self.view_in_transaction(connection, stage_run_id, org_id=principal.org_id)
 
     def stages(self, job_id: str, *, principal: CallerPrincipalV1) -> list[StageRunView]:
         with self.open_connection() as connection:
@@ -245,7 +252,10 @@ class SqlWorkflowEngine:
                 .scalars()
                 .all()
             )
-            views = [self.view_in_transaction(connection, stage_id) for stage_id in ids]
+            views = [
+                self.view_in_transaction(connection, stage_id, org_id=principal.org_id)
+                for stage_id in ids
+            ]
         # Follow persisted successor links, not this process's default definition.
         # This also orders jobs from other catalog entries and older pinned versions.
         by_id = {view.stage_run_id: view for view in views if view is not None}
@@ -295,6 +305,7 @@ class SqlWorkflowEngine:
             # for a NEW org after this read waits for the next drain, which is
             # the same at-least-once schedule every pending row is already on.
             with connection.begin():
+                self._require_legacy_drain(connection)
                 org_ids = [
                     row[0]
                     for row in connection.execute(
@@ -304,6 +315,7 @@ class SqlWorkflowEngine:
             for org_id in org_ids:
                 sink = SqlAlchemyOutbox(connection, self._tables, clock=self._clock, org_id=org_id)
                 with connection.begin():
+                    self._require_legacy_drain(connection)
                     one = OutboxDispatcher(
                         broker=broker,
                         clock=self._clock,
@@ -314,6 +326,21 @@ class SqlWorkflowEngine:
                 ambiguous += one.ambiguous
                 failed += one.failed
         return DispatchReport(published=published, ambiguous=ambiguous, failed=failed)
+
+    def _require_legacy_drain(self, connection: Connection) -> None:
+        inspector = inspect(connection)
+        pool_name = f"{self._prefix}admission_pool"
+        if inspector.has_table(f"{self._prefix}outbox_delivery"):
+            raise ConfigurationError("This ledger requires the owner-bound outbox drain")
+        if inspector.has_table(pool_name):
+            if connection.dialect.name == "sqlite":
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            pool = Table(pool_name, MetaData(), autoload_with=connection)
+            mode = connection.execute(
+                select(pool.c.mode).where(pool.c.id == 1).with_for_update()
+            ).scalar_one_or_none()
+            if mode != "legacy":
+                raise ConfigurationError("This ledger requires the owner-bound outbox drain")
 
     # -- internals ----------------------------------------------------------
 
@@ -329,8 +356,8 @@ class SqlWorkflowEngine:
         principal: CallerPrincipalV1,
     ) -> None:
         repository = SqlAlchemyStageRepository(connection, self._tables)
-        snapshot = repository.load(stage_run_id)
-        if snapshot is None or self._org_of(connection, stage_run_id) != principal.org_id:
+        snapshot = repository.load(stage_run_id, org_id=principal.org_id)
+        if snapshot is None:
             raise _Refused(str(RefusalClass.UNKNOWN_STAGE))
 
         command = build_command(
@@ -480,18 +507,37 @@ class SqlWorkflowEngine:
             select(stage_runs.c.org_id).where(stage_runs.c.stage_run_id == stage_run_id)
         ).scalar_one_or_none()
 
-    def view_in_transaction(self, connection: Connection, stage_run_id: str) -> StageRunView | None:
-        snapshot = SqlAlchemyStageRepository(connection, self._tables).load(stage_run_id)
+    def _has_execution_binding(self, connection, job_id, org_id):
+        bindings = self._execution_bindings
+        return inspect(connection).has_table(bindings.name) and connection.scalar(
+            select(bindings.c.job_id).where(
+                bindings.c.job_id == job_id, bindings.c.org_id == org_id
+            )
+        ) is not None
+
+    def view_in_transaction(
+        self, connection: Connection, stage_run_id: str, *, org_id: str | None = None
+    ) -> StageRunView | None:
+        org_id = org_id if org_id is not None else self._org_of(connection, stage_run_id)
+        if org_id is None:
+            return None
+        snapshot = SqlAlchemyStageRepository(connection, self._tables).load(
+            stage_run_id, org_id=org_id
+        )
         if snapshot is None:
             return None
         attempts = self._tables["attempts"]
         counted = connection.execute(
             select(func.count())
             .select_from(attempts)
-            .where(attempts.c.stage_run_id == stage_run_id)
+            .where(attempts.c.stage_run_id == stage_run_id, attempts.c.org_id == org_id)
         ).scalar_one()
         jobs = self._tables["jobs"]
         workflow_key = connection.execute(
-            select(jobs.c.workflow_key).where(jobs.c.job_id == snapshot.job_id)
-        ).scalar_one()
+            select(jobs.c.workflow_key).where(
+                jobs.c.job_id == snapshot.job_id, jobs.c.org_id == org_id
+            )
+        ).scalar_one_or_none()
+        if workflow_key is None:
+            return None
         return to_view(snapshot, workflow_key=workflow_key, attempts=int(counted) + 1)

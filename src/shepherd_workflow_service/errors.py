@@ -33,3 +33,11 @@ class StageRunConflict(ShepherdError):
 
 class StageRunRejected(ShepherdError):
     """The command could not be applied and retrying it unchanged will not help. 422."""
+
+
+class ExecutionBackpressure(ShepherdError):
+    """Admission is temporarily unavailable for a new submission."""
+
+    def __init__(self, retry_after: int = 5) -> None:
+        super().__init__("execution_backpressure")
+        self.retry_after = retry_after

@@ -18,7 +18,7 @@ from datetime import timedelta
 from urllib.parse import quote_plus
 
 from shepherd_contracts.clock import Clock, SystemClock
-from shepherd_contracts.errors import ConfigurationError
+from shepherd_contracts.errors import ConfigurationError, Unauthorized
 from shepherd_contracts.principal import CallerPrincipalV1, PrincipalMinter
 from shepherd_workflow.dispatcher import Broker, DispatchReport
 
@@ -26,7 +26,8 @@ from shepherd_workflow_service.adapters.fake.header_principal_auth import Header
 from shepherd_workflow_service.adapters.real.in_process_event_bus import InProcessEventBus
 from shepherd_workflow_service.adapters.real.readiness import EngineReadinessCheck
 from shepherd_workflow_service.config import ServiceConfig
-from shepherd_workflow_service.ports.auth import PrincipalAuth
+from shepherd_workflow_service.models.tenancy import TenantRegistry
+from shepherd_workflow_service.ports.auth import AuthenticateTenant, PrincipalAuth
 from shepherd_workflow_service.ports.event_bus import Publisher
 from shepherd_workflow_service.ports.execution import ExecutionConsumer
 from shepherd_workflow_service.ports.ledger_outbox import LedgerOutboxDrain
@@ -52,6 +53,11 @@ class InsecureDefaultAuth(RuntimeError):
     """Raised when a non-local service would fall back to unverified header auth."""
 
 
+class _DisabledInternalAuth:
+    def authenticate(self, headers: Mapping[str, str]) -> CallerPrincipalV1:
+        raise Unauthorized("internal authentication unavailable on tenant ingress")
+
+
 @dataclass
 class Container:
     config: ServiceConfig
@@ -71,6 +77,8 @@ class Container:
     observations: Observability | None = None
     execution_service: ExecutionService | None = None
     execution_consumer_factory: Callable[[], ExecutionConsumer] | None = None
+    tenant_outbox_factory: Callable | None = None
+    tenant_authenticate: AuthenticateTenant | None = None
 
     def authenticate(self, headers: Mapping[str, str]) -> CallerPrincipalV1:
         return self.principal_auth.authenticate(headers)
@@ -84,6 +92,8 @@ class Container:
         `AttributeError` somewhere further down, and "drained nothing" is
         byte-identical to "there was nothing to drain".
         """
+        if self.tenant_outbox_factory is not None:
+            return self.tenant_outbox_factory().drain(batch_size=batch_size)
         if not isinstance(self.ledger_outbox, LedgerOutboxDrain):
             raise ConfigurationError(
                 f"the wired ledger outbox {type(self.ledger_outbox).__name__!r} has no "
@@ -141,6 +151,29 @@ def build_container(
     )
 
     resolved_readiness = readiness_check or EngineReadinessCheck(resolved_engine)
+    if (
+        config.tenant_http_profile and config.env not in LOCAL_ENVS
+        and not (config.tenant_registry_secret_id or config.tenant_registry_path)
+    ):
+        raise ConfigurationError("deployed tenant ingress requires a refreshable workload registry")
+    resolved_tenant_secrets = secrets
+    if resolved_tenant_secrets is None and config.aws_region and (
+        config.tenant_http_profile or config.tenant_registry_secret_id
+    ):
+        from shepherd_workflow_service.adapters.real.aws_secrets_manager import (
+            AwsSecretsManagerSecrets,
+        )
+
+        resolved_tenant_secrets = AwsSecretsManagerSecrets(region=config.aws_region, cache=False)
+
+    def load_registry() -> TenantRegistry | None:
+        return config.load_tenant_registry(
+            read_secret=resolved_tenant_secrets.get if resolved_tenant_secrets else None,
+        )
+
+    tenant_registry = load_registry()
+    tenant_authenticate = None
+    current_registry = None
 
     # FAIL CLOSED ON AUTH. `HeaderPrincipalAuth` verifies no signature: it trusts
     # x-org-id and x-scopes as sent, so under it any caller is any tenant with any
@@ -152,7 +185,38 @@ def build_container(
     # service that forgets real auth now dies in `build_container()`, at startup,
     # with the fix in the message. That is the whole point of the check: the
     # alternative is not "insecure", it is "insecure and green".
-    if principal_auth is not None:
+    if config.tenant_http_profile:
+        from shepherd_workflow_service.adapters.real.jwt_principal_auth import JwksKeyResolver
+        from shepherd_workflow_service.adapters.real.tenant_registry_snapshot import (
+            TENANT_REGISTRY_REFRESH_SECONDS,
+            TenantRegistrySnapshot,
+        )
+        from shepherd_workflow_service.adapters.real.tenant_workload_auth import TenantWorkloadAuth
+
+        assert tenant_registry and config.auth_jwks_uri
+        assert config.auth_issuer and config.auth_audience
+        current_registry = (
+            TenantRegistrySnapshot(
+                tenant_registry, load=load_registry,
+                refresh_seconds=(
+                    TENANT_REGISTRY_REFRESH_SECONDS if config.tenant_registry_secret_id else 0
+                ),
+            ).current
+            if config.tenant_registry_secret_id or config.tenant_registry_path
+            else lambda: tenant_registry
+        )
+
+        tenant_authenticate = TenantWorkloadAuth(
+            key_resolver=JwksKeyResolver(config.auth_jwks_uri),
+            registry=current_registry,
+            issuer=config.auth_issuer,
+            audience=config.auth_audience,
+            proxy_networks=config.tenant_proxy_networks(),
+            profile=config.tenant_token_profile,
+            clock=resolved_clock,
+        ).authenticate
+        resolved_auth = _DisabledInternalAuth()
+    elif principal_auth is not None:
         resolved_auth: PrincipalAuth = principal_auth
     elif config.auth_jwks_uri and config.auth_audience:
         # Configured for real auth: verify signatures. Constructed eagerly but
@@ -165,7 +229,7 @@ def build_container(
         resolved_auth = JwtPrincipalAuth(
             PrincipalMinter(issuer=config.issuer),
             JwksKeyResolver(config.auth_jwks_uri),
-            issuer=config.issuer,
+            issuer=config.auth_issuer or config.issuer,
             audience=config.auth_audience,
         )
     elif config.env in LOCAL_ENVS:
@@ -180,20 +244,41 @@ def build_container(
             "genuinely a local run."
         )
 
-    execution_service, consumer_factory = _build_execution(config, resolved_clock, resolved_secrets)
+    execution_service, consumer_factory = _build_execution(
+        config, resolved_clock, resolved_secrets, tenant_registry=tenant_registry
+    )
     if execution_service is not None and readiness_check is None:
-        resolved_readiness = EngineReadinessCheck(
-            resolved_engine, validate=execution_service.repository.check_ready
-        )
+        def validate_execution() -> None:
+            if current_registry is not None:
+                current_registry()
+            execution_service.repository.check_ready()
+
+        resolved_readiness = EngineReadinessCheck(resolved_engine, validate=validate_execution)
     from shepherd_workflow_service.adapters.real.sql_observability import SqlObservability
     resolved_observations = observations if observations is not None else (
         SqlObservability(resolved_engine, resolved_clock)
         if execution_service is not None else None
     )
+    broker_factory = _ledger_broker_factory(config, publisher, resolved_clock)
+    tenant_outbox_factory = None
+    if config.tenant_http_profile:
+        from shepherd_workflow_service.tenant_runtime import build_tenant_delivery
+
+        if not config.workflow_event_bus and publisher is None:
+            raise ConfigurationError("tenant execution requires a private workflow event bus")
+        if execution_service is None:
+            raise ConfigurationError("tenant execution requires a workflow catalog")
+        tenant_outbox_factory = build_tenant_delivery(
+            config, engine=resolved_engine, repository=execution_service.repository,
+            broker_factory=broker_factory, secrets=resolved_tenant_secrets, clock=resolved_clock,
+            registry=tenant_registry,
+        )
     return Container(
         observations=resolved_observations,
         execution_service=execution_service,
         execution_consumer_factory=consumer_factory,
+        tenant_authenticate=tenant_authenticate,
+        tenant_outbox_factory=tenant_outbox_factory,
         config=config,
         clock=resolved_clock,
         publisher=resolved_publisher,
@@ -206,7 +291,7 @@ def build_container(
         # substituted for silently -- `drain_ledger_outbox()` refuses it by name.
         ledger_outbox=ledger_outbox if ledger_outbox is not None else resolved_engine,
         # `publisher`, NOT `resolved_publisher`. See `_ledger_broker_factory`.
-        ledger_broker_factory=_ledger_broker_factory(config, publisher, resolved_clock),
+        ledger_broker_factory=broker_factory,
     )
 
 
@@ -235,10 +320,15 @@ def _ledger_broker_factory(
             return PublisherBroker(publisher, clock=clock)
         if config.workflow_event_bus:
             import boto3
+            from botocore.config import Config
 
             from shepherd_workflow_service.adapters.real.eventbridge_broker import EventBridgeBroker
             return EventBridgeBroker(
-                client=boto3.client("events", region_name=config.aws_region),
+                client=boto3.client(
+                    "events", region_name=config.aws_region,
+                    config=Config(connect_timeout=5, read_timeout=5,
+                                  retries={"total_max_attempts": 2}),
+                ),
                 bus_name=config.workflow_event_bus, producer=config.issuer, clock=clock,
             )
         if not config.sqs_queue_url:
@@ -389,13 +479,14 @@ def _catalog_default(path):
     return JsonWorkflowCatalog(path).load().workflows[0].ledger_definition()
 
 
-def _build_execution(config, clock, secrets):
+def _build_execution(config, clock, secrets, *, tenant_registry=None):
     if not config.workflow_catalog_path:
         return None, None
     from shepherd_workflow_service.adapters.real.queue_execution import QueueExecutionConsumer
     from shepherd_workflow_service.adapters.real.sql_execution import SqlExecutionRepository
     from shepherd_workflow_service.adapters.real.sql_workflow_engine import SqlWorkflowEngine
     from shepherd_workflow_service.adapters.real.workflow_catalog import JsonWorkflowCatalog
+    from shepherd_workflow_service.services.scheduling_strategy import SchedulingStrategy
 
     catalog = JsonWorkflowCatalog(config.workflow_catalog_path)
     engines = {}
@@ -410,11 +501,29 @@ def _build_execution(config, clock, secrets):
             )
         return engines[definition.digest]
 
+    scheduled = config.tenant_http_profile
+    scheduler = None
+    authorize_artifact = None
+    if scheduled:
+        from shepherd_workflow_service.tenant_runtime import build_artifact_access
+
+        if config.env not in LOCAL_ENVS and config.db_backend != "mysql":
+            raise ConfigurationError("deployed tenant execution requires shared MySQL")
+        if tenant_registry is None:
+            raise ConfigurationError("tenant execution requires a workload registry")
+        authorize_artifact = build_artifact_access(config, tenant_registry).allows
+        scheduler = SchedulingStrategy(
+            age_threshold=timedelta(seconds=config.tenant_queue_age_seconds)
+        )
     repository = SqlExecutionRepository(
         catalog=catalog, engine_factory=engine_factory, clock=clock,
         prefix=config.workflow_table_prefix, producer=config.issuer,
+        scheduler=scheduler,
+        pool_capacity=config.tenant_pool_capacity,
+        tenant_registry=tenant_registry if scheduled else None,
+        authorize_artifact=authorize_artifact,
     )
-    service = ExecutionService(repository)
+    service = ExecutionService(repository, tenant_registry=tenant_registry if scheduled else None)
 
     def consumer_factory():
         if config.env not in LOCAL_ENVS and config.db_backend != "mysql":
@@ -431,22 +540,32 @@ def _build_execution(config, clock, secrets):
             issuer=config.issuer, allowed_tenants=config.workflow_event_tenants,
         )
 
-    return service, consumer_factory
+    return service, None if scheduled else consumer_factory
 
 
 def build_execution_cycle(container):
     import sys
 
     from shepherd_workflow_service.adapters.real.emf_metrics import EmfMetrics
-    from shepherd_workflow_service.services.execution_cycle import ExecutionCycle
+    from shepherd_workflow_service.services.execution_cycle import (
+        ExecutionCycle,
+        ScheduledExecutionCycle,
+    )
 
-    if (container.execution_consumer_factory is None or container.execution_service is None
-            or container.observations is None):
+    if container.execution_service is None or container.observations is None:
         raise ConfigurationError("execution worker requires WORKFLOW_CATALOG_PATH")
+    metrics = EmfMetrics(stream=sys.stdout, service=container.config.issuer,
+                         environment=container.config.env, clock=container.clock)
+    if container.config.tenant_http_profile:
+        return ScheduledExecutionCycle(
+            service=container.execution_service, drain=container.drain_ledger_outbox,
+            observations=container.observations, metrics=metrics,
+        )
+    if container.execution_consumer_factory is None:
+        raise ConfigurationError("legacy execution requires a queue consumer")
     return ExecutionCycle(
         consumer=container.execution_consumer_factory(),
         service=container.execution_service, drain=container.drain_ledger_outbox,
         observations=container.observations,
-        metrics=EmfMetrics(stream=sys.stdout, service=container.config.issuer,
-                          environment=container.config.env, clock=container.clock),
+        metrics=metrics,
     )

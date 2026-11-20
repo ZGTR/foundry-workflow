@@ -9,7 +9,7 @@ covered by `tests/unit/test_header_principal_auth.py`.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 from shepherd_contracts.principal import CallerPrincipalV1
@@ -19,4 +19,12 @@ from shepherd_contracts.principal import CallerPrincipalV1
 class PrincipalAuth(Protocol):
     def authenticate(self, headers: Mapping[str, str]) -> CallerPrincipalV1:
         """Mint a principal from inbound request headers, or raise `Unauthorized`."""
+        ...
+
+
+class AuthenticateTenant(Protocol):
+    def __call__(
+        self, headers: Sequence[tuple[bytes, bytes]], *, peer_ip: str | None
+    ) -> CallerPrincipalV1:
+        """Verify a tenant workload using raw HTTP headers and the immediate socket peer."""
         ...

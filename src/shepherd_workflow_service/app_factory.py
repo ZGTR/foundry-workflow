@@ -6,12 +6,14 @@ so every controller handler stays a straight-line parse/call/serialise.
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from shepherd_contracts.errors import ConfigurationError, PolicyRefused, Unauthorized
 
 from shepherd_workflow_service.container import Container
-from shepherd_workflow_service.controllers import execution, health, observability, workflow
+from shepherd_workflow_service.controllers import execution, health, observability, tenant, workflow
 from shepherd_workflow_service.errors import (
+    ExecutionBackpressure,
     StageRunConflict,
     StageRunNotFound,
     StageRunRejected,
@@ -33,27 +35,60 @@ _STATUS_BY_ERROR = (
 
 
 def create_app(container: Container) -> FastAPI:
-    app = FastAPI(title="foundry-workflow")
+    tenant_profile = container.config.tenant_http_profile
+    app = FastAPI(title="foundry-workflow", **(
+        {"openapi_url": None, "docs_url": None, "redoc_url": None, "redirect_slashes": False}
+        if tenant_profile else {}
+    ))
     app.include_router(health.build_router(container.readiness_check))
-    app.include_router(
-        workflow.build_router(container.workflow_service, container.authenticate)
-    )
-
-    if container.execution_service is not None:
-        app.include_router(execution.build_router(
-            container.execution_service, container.authenticate
+    if tenant_profile:
+        if (
+            container.tenant_authenticate is None or container.execution_service is None
+            or container.observations is None
+        ):
+            raise ConfigurationError("tenant ingress requires auth, execution and history")
+        app.include_router(tenant.build_router(
+            container.execution_service, container.observations, container.tenant_authenticate
         ))
-
-    if container.observations is not None:
+        app.add_exception_handler(RequestValidationError, _invalid_tenant_request)
+    else:
         app.include_router(
-            observability.build_router(container.observations, container.authenticate)
+            workflow.build_router(container.workflow_service, container.authenticate)
         )
+        if container.execution_service is not None:
+            app.include_router(execution.build_router(
+                container.execution_service, container.authenticate
+            ))
+        if container.observations is not None:
+            app.include_router(
+                observability.build_router(container.observations, container.authenticate)
+            )
 
     for error_type, status_code in _STATUS_BY_ERROR:
 
         def _handler(request: Request, exc: Exception, *, _code: int = status_code) -> JSONResponse:
-            return JSONResponse(status_code=_code, content={"detail": str(exc)})
+            detail = str(exc)
+            if tenant_profile:
+                detail = {
+                    401: "unauthorized",
+                    403: "operation not permitted",
+                    404: "job or stage not found",
+                    500: "service unavailable",
+                }.get(_code, detail)
+            return JSONResponse(status_code=_code, content={"detail": detail})
 
         app.add_exception_handler(error_type, _handler)
 
+    app.add_exception_handler(ExecutionBackpressure, _execution_backpressure)
     return app
+
+
+def _invalid_tenant_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"detail": "invalid request"})
+
+
+def _execution_backpressure(request: Request, exc: ExecutionBackpressure) -> JSONResponse:
+    return JSONResponse(
+        status_code=429, headers={"Retry-After": str(exc.retry_after)},
+        content={"detail": "workflow intake at capacity"},
+    )

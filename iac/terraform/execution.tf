@@ -2,7 +2,7 @@
 # Subscription keys are sorted here and compiled from the runtime catalog.
 module "execution_queue" {
   source  = "git::https://github.com/ZGTR/comms-eventing.git//iac/modules/consumer_queue?ref=02a394333ec038fa4cf0ea79ffc5504b5bd79386"
-  enabled = var.execution_enabled
+  enabled = var.execution_enabled && !var.tenant_profile
   name    = "${var.service_name}-${var.environment}-execution"
   subscriptions = [
     for key in sort(keys(var.execution_subscriptions)) : {
@@ -27,10 +27,13 @@ locals {
     { name = "AUTH_JWKS_URI", value = var.auth_jwks_uri },
     { name = "AUTH_AUDIENCE", value = var.auth_audience },
     { name = "WORKFLOW_CATALOG_PATH", value = var.workflow_catalog_path },
-    { name = "WORKFLOW_EVENT_BUS", value = var.workflow_event_bus_name },
+    { name = "WORKFLOW_EVENT_BUS", value = var.tenant_profile ? aws_cloudwatch_event_bus.tenant[0].name : var.workflow_event_bus_name },
+  ]
+  execution_ingress_environment = var.tenant_profile ? [] : [
     { name = "WORKFLOW_EVENT_TENANTS", value = join(",", var.workflow_event_tenants) },
     { name = "WORKFLOW_INGRESS_QUEUE_URL", value = module.execution_queue.queue_url },
   ]
+  execution_runtime_environment = concat(local.execution_environment, local.execution_ingress_environment)
 }
 
 resource "aws_ecs_task_definition" "execution" {
@@ -41,13 +44,13 @@ resource "aws_ecs_task_definition" "execution" {
   cpu                      = var.task_cpu
   memory                   = var.task_memory
   execution_role_arn       = aws_iam_role.execution.arn
-  task_role_arn            = aws_iam_role.task.arn
+  task_role_arn            = var.tenant_profile ? aws_iam_role.tenant_worker[0].arn : aws_iam_role.task.arn
   container_definitions = jsonencode([{
     name      = "execution"
     image     = var.image_uri
     essential = true
     command   = ["/opt/venv/bin/python", "-m", "shepherd_workflow_service.execution_main"]
-    environment = concat(local.execution_environment, [
+    environment = concat(local.execution_runtime_environment, local.tenant_environment, local.worker_tenant_environment, [
       { name = "SERVICE_ENV", value = var.environment },
       { name = "PRINCIPAL_ISSUER", value = "foundry-workflow" },
     ])
@@ -63,13 +66,15 @@ resource "aws_ecs_task_definition" "execution" {
   lifecycle {
     precondition {
       condition = (
-        length(var.execution_subscriptions) > 0 && length(var.workflow_event_tenants) > 0
-        && var.workflow_event_bus_arn != "" && var.workflow_event_bus_name != ""
+        (var.tenant_profile || (
+          length(var.execution_subscriptions) > 0 && length(var.workflow_event_tenants) > 0
+          && var.workflow_event_bus_arn != "" && var.workflow_event_bus_name != ""
+        ))
         && var.workflow_catalog_path != "" && var.db_host != ""
         && var.db_name != "" && var.db_user != "" && var.db_password_secret_arn != ""
         && var.auth_jwks_uri != "" && var.auth_audience != ""
       )
-      error_message = "Execution requires subscriptions, tenants, bus, catalog, MySQL and signed auth."
+      error_message = "Execution requires a catalog, MySQL and signed auth. Legacy execution also requires subscriptions, tenants and a bus."
     }
   }
 }
@@ -87,13 +92,14 @@ resource "aws_ecs_service" "execution" {
   }
   network_configuration {
     subnets          = data.aws_subnets.private.ids
-    security_groups  = [aws_security_group.service.id]
+    security_groups  = [var.tenant_profile ? aws_security_group.tenant_worker[0].id : aws_security_group.service.id]
     assign_public_ip = false
   }
+  depends_on = [aws_iam_role_policy.tenant_worker, aws_cloudwatch_event_bus_policy.tenant]
 }
 
 resource "aws_iam_role_policy" "execution" {
-  count = var.execution_enabled ? 1 : 0
+  count = var.execution_enabled && !var.tenant_profile ? 1 : 0
   name  = "workflow-execution"
   role  = aws_iam_role.task.id
   policy = jsonencode({

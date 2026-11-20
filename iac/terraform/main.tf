@@ -88,7 +88,9 @@ resource "aws_ecs_task_definition" "this" {
       portMappings = [
         { containerPort = 8080, protocol = "tcp" }
       ]
-      environment = concat(var.execution_enabled ? local.execution_environment : [], [
+      environment = concat(var.execution_enabled ? local.execution_runtime_environment : [], local.tenant_environment, var.tenant_profile && var.tenant_gateway != null ? [
+        { name = "TENANT_TLS_SECRET_ID", value = var.tenant_gateway.backend_tls_secret_arn },
+        ] : [], [
         { name = "SERVICE_ENV", value = var.environment },
         { name = "PRINCIPAL_ISSUER", value = "foundry-workflow" },
         # EVENT_BUS_MODE deliberately absent -- see the note in serverless.yml:
@@ -105,7 +107,7 @@ resource "aws_ecs_task_definition" "this" {
         }
       }
       healthCheck = {
-        command     = ["CMD", "/opt/venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).close()"]
+        command     = ["CMD", "/opt/venv/bin/python", "-c", var.tenant_profile ? local.tenant_health_check : "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3).close()"]
         interval    = 30
         timeout     = 5
         retries     = 3
@@ -113,6 +115,20 @@ resource "aws_ecs_task_definition" "this" {
       }
     }
   ])
+
+  lifecycle {
+    precondition {
+      condition = !var.tenant_profile || (
+        var.execution_enabled && var.tenant_gateway != null
+        && var.sqs_queue_arn == "" && length(var.workflow_event_tenants) == 0
+        && length(var.execution_subscriptions) == 0
+        && var.workflow_event_bus_name == "" && var.workflow_event_bus_arn == ""
+        && startswith(var.auth_jwks_uri, "https://")
+        && can(regex("^arn:aws[^:]*:secretsmanager:[^:*]+:[0-9]{12}:secret:[^*?]+$", var.db_password_secret_arn))
+      )
+      error_message = "The tenant profile requires its gateway, execution worker, HTTPS JWKS and a database secret ARN, with all legacy event bus, SQS and subscription inputs empty."
+    }
+  }
 }
 
 resource "aws_ecs_service" "this" {
@@ -139,7 +155,7 @@ resource "aws_ecs_service" "this" {
     container_port   = 8080
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.http, aws_lb_listener_rule.tenant, aws_iam_role_policy.tenant_api]
 }
 
 # --- ALB + target group -----------------------------------------------
@@ -183,21 +199,36 @@ resource "aws_security_group" "alb" {
 }
 
 resource "aws_lb" "this" {
-  name               = "${var.service_name}-${var.environment}"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = data.aws_subnets.public.ids
+  name                       = "${var.service_name}-${var.environment}"
+  internal                   = false
+  load_balancer_type         = "application"
+  security_groups            = [aws_security_group.alb.id]
+  subnets                    = var.tenant_profile && var.tenant_gateway != null ? var.tenant_gateway.alb_subnet_ids : data.aws_subnets.public.ids
+  desync_mitigation_mode     = var.tenant_profile ? "strictest" : "defensive"
+  drop_invalid_header_fields = var.tenant_profile
+  enable_waf_fail_open       = false
+  client_keep_alive          = var.tenant_profile ? 60 : null
+
+  lifecycle {
+    precondition {
+      condition = !var.tenant_profile || (
+        length(toset([for subnet in data.aws_subnet.tenant_alb : subnet.availability_zone])) >= 2
+        && alltrue([for subnet in data.aws_subnet.tenant_alb : subnet.vpc_id == var.vpc_id])
+      )
+      error_message = "The tenant ALB requires subnets in at least two availability zones in its VPC."
+    }
+  }
 }
 
 resource "aws_lb_target_group" "this" {
   name        = "${var.service_name}-${var.environment}"
   port        = 8080
-  protocol    = "HTTP"
+  protocol    = var.tenant_profile ? "HTTPS" : "HTTP"
   vpc_id      = var.vpc_id
   target_type = "ip"
 
   health_check {
+    protocol            = var.tenant_profile ? "HTTPS" : "HTTP"
     path                = "/readyz" # readiness, not liveness -- an ALB should drain, not just detect a dead process
     healthy_threshold   = 2
     unhealthy_threshold = 3
@@ -212,9 +243,27 @@ resource "aws_lb_listener" "http" {
   protocol          = "HTTPS"
   certificate_arn   = var.certificate_arn
 
+  ssl_policy = var.tenant_profile ? "ELBSecurityPolicy-TLS13-1-2-2021-06" : null
+
+  dynamic "mutual_authentication" {
+    for_each = module.tenant_client_auth[*].listener_authentication
+    content {
+      mode                             = mutual_authentication.value.mode
+      trust_store_arn                  = mutual_authentication.value.trust_store_arn
+      ignore_client_certificate_expiry = mutual_authentication.value.ignore_client_certificate_expiry
+    }
+  }
+
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.this.arn
+    type             = var.tenant_profile ? "fixed-response" : "forward"
+    target_group_arn = var.tenant_profile ? null : aws_lb_target_group.this.arn
+    dynamic "fixed_response" {
+      for_each = var.tenant_profile ? [1] : []
+      content {
+        content_type = "text/plain"
+        status_code  = "404"
+      }
+    }
   }
 }
 
@@ -246,7 +295,7 @@ resource "aws_iam_role" "task" {
 }
 
 resource "aws_iam_role_policy" "task_sqs" {
-  count = var.sqs_queue_arn != "" ? 1 : 0
+  count = !var.tenant_profile && var.sqs_queue_arn != "" ? 1 : 0
   name  = "outbox-publish"
   role  = aws_iam_role.task.id
 

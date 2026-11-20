@@ -4,6 +4,7 @@ from datetime import UTC
 from sqlalchemy import case, func, or_, select
 
 from shepherd_workflow_service.errors import StageRunNotFound
+from shepherd_workflow_service.models.tenancy import is_tenant_principal
 
 
 class SqlObservability:
@@ -49,7 +50,7 @@ class SqlObservability:
         }
 
     def history(self, job_id, principal, limit):
-        principal.require("jobs:read")
+        principal.require("workflow:read" if is_tenant_principal(principal) else "jobs:read")
         jobs, outbox = self.engine.tables["jobs"], self.engine.tables["outbox"]
         with self.engine.open_connection() as connection:
             visible = connection.execute(select(jobs.c.job_id).where(
