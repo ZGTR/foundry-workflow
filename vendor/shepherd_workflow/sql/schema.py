@@ -28,8 +28,19 @@ from sqlalchemy import (
     Table,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.mysql import VARCHAR
 
 from shepherd_workflow.ports import DEFAULT_TABLE_PREFIX, LOGICAL_TABLES
+
+TENANT_COLLATION = "utf8mb4_0900_bin"
+
+
+def tenant_id_column_type(length: int = 64):
+    # MySQL's usual collations fold case or accents, and older binary ones pad.
+    # SQLite uses BINARY comparison for a string column by default.
+    return String(length).with_variant(
+        VARCHAR(length, charset="utf8mb4", collation=TENANT_COLLATION), "mysql"
+    )
 
 
 def build_tables(metadata: MetaData, *, prefix: str = DEFAULT_TABLE_PREFIX) -> dict[str, Table]:
@@ -41,7 +52,7 @@ def build_tables(metadata: MetaData, *, prefix: str = DEFAULT_TABLE_PREFIX) -> d
         f"{prefix}jobs",
         metadata,
         Column("job_id", String(64), primary_key=True),
-        Column("org_id", String(64), nullable=False, index=True),
+        Column("org_id", tenant_id_column_type(), nullable=False, index=True),
         Column("workflow_key", String(128), nullable=False),
         Column("workflow_digest", String(64), nullable=False),
         Column("status", String(32), nullable=False),
@@ -53,9 +64,9 @@ def build_tables(metadata: MetaData, *, prefix: str = DEFAULT_TABLE_PREFIX) -> d
         metadata,
         Column("stage_run_id", String(64), primary_key=True),
         Column("job_id", String(64), nullable=False, index=True),
-        Column("org_id", String(64), nullable=False, index=True),
+        Column("org_id", tenant_id_column_type(), nullable=False, index=True),
         Column("workflow_digest", String(64), nullable=False),
-        Column("stage_key", String(128), nullable=False),
+        Column("stage_key", tenant_id_column_type(128), nullable=False),
         # state_version is the compare-and-set column. Every conditional UPDATE
         # in repository.py keys on it, and it is why two writers cannot both win.
         Column("state_version", Integer, nullable=False, default=0),
@@ -84,7 +95,7 @@ def build_tables(metadata: MetaData, *, prefix: str = DEFAULT_TABLE_PREFIX) -> d
         metadata,
         Column("attempt_id", String(64), primary_key=True),
         Column("stage_run_id", String(64), nullable=False, index=True),
-        Column("org_id", String(64), nullable=False),
+        Column("org_id", tenant_id_column_type(), nullable=False),
         Column("fence", BigInteger, nullable=False),
         Column("started_at", DateTime(timezone=True), nullable=False),
         Column("outcome", String(32), nullable=True),
@@ -95,7 +106,7 @@ def build_tables(metadata: MetaData, *, prefix: str = DEFAULT_TABLE_PREFIX) -> d
         metadata,
         Column("event_id", String(64), primary_key=True),
         Column("stage_run_id", String(64), nullable=False, index=True),
-        Column("org_id", String(64), nullable=False),
+        Column("org_id", tenant_id_column_type(), nullable=False),
         Column("event_class", String(64), nullable=False),
         Column("occurred_at", DateTime(timezone=True), nullable=False),
         Column("payload", JSON, nullable=False),
@@ -108,7 +119,7 @@ def build_tables(metadata: MetaData, *, prefix: str = DEFAULT_TABLE_PREFIX) -> d
         # makes a retried enqueue a no-op instead of a duplicate publish -- the
         # database refuses it rather than the application remembering to.
         Column("key", String(64), primary_key=True),
-        Column("org_id", String(64), nullable=False, index=True),
+        Column("org_id", tenant_id_column_type(), nullable=False, index=True),
         Column("event_class", String(64), nullable=False),
         Column("payload", JSON, nullable=False),
         Column("created_at", DateTime(timezone=True), nullable=False),

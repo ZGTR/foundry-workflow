@@ -4,7 +4,7 @@ Connects LAZILY, like every other real adapter here, so `build_container()`
 stays network-free and `test_container_builds_with_zero_network_access` keeps
 holding once a service wires this in.
 
-Values are cached for the process lifetime. That is deliberate and it is a
+Values are cached for the process lifetime by default. That is deliberate and it is a
 trade-off worth naming: it keeps a hot path off the network, and it means a
 rotated secret needs a new task rather than being picked up mid-process. The
 alternative -- re-reading per call -- is the ambient-config bug pattern
@@ -17,16 +17,24 @@ from shepherd_workflow_service.ports.secrets import SecretNotFound
 
 
 class AwsSecretsManagerSecrets:
-    def __init__(self, *, region: str, client=None) -> None:
+    def __init__(self, *, region: str, client=None, cache: bool = True) -> None:
         self._region = region
         self._client = client
+        self._cache_enabled = cache
         self._cache: dict[str, str] = {}
 
     def _resolve_client(self):
         if self._client is None:
             import boto3  # imported here so building the container touches no network
 
-            self._client = boto3.client("secretsmanager", region_name=self._region)
+            options = {}
+            if not self._cache_enabled:
+                from botocore.config import Config
+
+                options["config"] = Config(
+                    connect_timeout=3, read_timeout=3, retries={"total_max_attempts": 1},
+                )
+            self._client = boto3.client("secretsmanager", region_name=self._region, **options)
         return self._client
 
     def get(self, name: str) -> str:
@@ -39,5 +47,6 @@ class AwsSecretsManagerSecrets:
         value = response.get("SecretString")
         if value is None:
             raise SecretNotFound(f"secret {name!r} has no SecretString")
-        self._cache[name] = value
+        if self._cache_enabled:
+            self._cache[name] = value
         return value

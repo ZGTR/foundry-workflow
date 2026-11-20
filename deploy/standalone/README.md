@@ -45,3 +45,17 @@ These are local container checks. A production deployment, its database integrat
 The MySQL receipt records ten checks: idempotent start, tenant isolation, one winning concurrent claim, stale-fence refusal, retained lease after database restart, duplicate completion refusal, persisted retry delay with a new fence, the single-attempt source limit, all five stages reaching `review_wait`, and identical retained stage state after another restart. These are ledger commands with labelled test artifacts, not teaching-content generation or production database proof.
 
 Both probes now publish success only after Docker confirms their owned resources are absent. They bind the probe bytes before execution and refuse a receipt if those bytes change; the MySQL probe also binds the imported runtime source tree. Six negative unit controls cover false cleanup success, unavailable Docker, an already absent resource, unrelated resource names, changed source and receipt collisions. Receipts are written where `--receipt` points and are not committed to this repository.
+
+## Local MySQL tenant admission verification
+
+Run the tenant admission probe with the development dependencies and a locally available MySQL 8.0.46 image.
+
+```sh
+PYTHONPATH=.:src:vendor .venv/bin/python deploy/standalone/verify_mysql_tenant_admission.py \
+  --image mysql:8.0.46 \
+  --receipt /tmp/workflow-mysql-tenant-admission.json
+```
+
+The probe uses the checked-in `contracts/examples/catalog.v2.json` and a fresh, loopback-only database. It sends signed certificate-bound test credentials through the workload authenticator and exercises tenant-scoped submissions, reads and completions against the SQL ledger. Concurrent workers exercise pool, tenant and backlog caps. The probe injects a failure before lease commit, restarts MySQL mid-visit, checks revocation and verifies that migration changes ownership comparisons from collation aliases to byte-exact matches. The receipt binds the catalog, probe and runtime sources and records Docker cleanup.
+
+The test simulates a verified gateway peer in-process. Validate the deployed gateway, certificate revocation, issuer and external transports in staging.

@@ -38,7 +38,7 @@ SERVICE="foundry-workflow"
 # not equal the number of arms is the "category count is not a coverage claim"
 # defect in miniature: the terminal line said "all 8 arm(s) executed" from RAN,
 # while the thing that could REFUSE was comparing against a smaller number.
-EXPECTED_ARMS=8
+EXPECTED_ARMS=9
 RAN=0
 FAILED=0
 
@@ -79,7 +79,7 @@ done
 
 command -v npx >/dev/null 2>&1 || refuse "'npx' is not on PATH; install Node to run 'serverless print'"
 
-# --- arms 1-4: terraform, in a COPY -------------------------------------------
+# --- terraform, in a COPY -------------------------------------------
 #
 # The copy is not tidiness. `init` REWRITES `.terraform.lock.hcl` with hashes
 # from whichever registry the binary uses, so validating with OpenTofu in place
@@ -91,6 +91,7 @@ cp -R "$TF_DIR/." "$WORK/"
 
 tf_init() { (cd "$WORK" && "$TF_BIN" init -backend=false -input=false >/dev/null); }
 tf_validate() { (cd "$WORK" && "$TF_BIN" validate >/dev/null); }
+tf_test() { (cd "$WORK" && "$TF_BIN" test -no-color); }
 tf_fmt() { (cd "$TF_DIR" && "$TF_BIN" fmt -check -recursive >/dev/null); }
 tf_lock_untouched() {
   git -C "$ROOT_DIR" diff --quiet -- "iac/terraform/.terraform.lock.hcl"
@@ -98,6 +99,7 @@ tf_lock_untouched() {
 
 arm "terraform init (no backend)" tf_init
 arm "terraform validate" tf_validate
+arm "terraform mocked tenant gateway tests" tf_test
 arm "terraform fmt -check" tf_fmt
 arm "the repo's .terraform.lock.hcl was not rewritten" tf_lock_untouched
 

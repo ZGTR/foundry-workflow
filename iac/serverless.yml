@@ -26,6 +26,9 @@ provider:
     # /tmp is the only writable path in a Lambda image. The name is this SERVICE's:
     # `widgets.db` was the emitted example domain and read, in a deploy log, as if a
     # workflow ledger stored widgets.
+    # This legacy Lambda function cannot join the ECS tenant ledger.
+    TENANT_HTTP_PROFILE: "false"
+    DB_BACKEND: sqlite
     DB_PATH: /tmp/workflow.db
     # The workflow this deployment runs. There is no built-in default and no fallback:
     # a workflow service with no workflow accepts jobs it can never advance, and every

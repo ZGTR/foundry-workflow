@@ -119,3 +119,63 @@ variable "execution_subscriptions" {
   }))
   default = {}
 }
+
+variable "tenant_profile" {
+  description = "Enable the ECS HTTPS-only tenant profile on a dedicated ledger and deployment."
+  type        = bool
+  default     = false
+}
+
+variable "tenant_gateway" {
+  description = "Tenant gateway inputs. Pin the S3 CA bundle and CRL versions and supply Secrets Manager ARNs for the workload registry and backend TLS key pair."
+  type = object({
+    alb_subnet_ids                 = set(string)
+    trust_store_bucket             = string
+    ca_bundle_key                  = string
+    ca_bundle_object_version       = string
+    revocation_list_key            = string
+    revocation_list_object_version = string
+    backend_tls_secret_arn         = string
+    registry_secret_arn            = string
+    auth_issuer                    = string
+    token_profile                  = optional(string, "rfc9068")
+    pool_capacity                  = optional(number, 16)
+    queue_age_seconds              = optional(number, 60)
+    artifact_prefixes              = optional(map(list(string)), {})
+    callback_registry_secret_arn   = optional(string)
+    callback_signing_secret_arns   = optional(set(string), [])
+  })
+  default = null
+
+  validation {
+    condition = var.tenant_gateway == null ? true : (
+      length(var.tenant_gateway.alb_subnet_ids) >= 2
+      && startswith(var.tenant_gateway.auth_issuer, "https://")
+      && contains(["rfc9068", "cognito"], var.tenant_gateway.token_profile)
+      && var.tenant_gateway.pool_capacity >= 1
+      && floor(var.tenant_gateway.pool_capacity) == var.tenant_gateway.pool_capacity
+      && var.tenant_gateway.queue_age_seconds >= 1 && var.tenant_gateway.queue_age_seconds <= 604800
+      && floor(var.tenant_gateway.queue_age_seconds) == var.tenant_gateway.queue_age_seconds
+      && alltrue([
+        for value in [
+          var.tenant_gateway.trust_store_bucket, var.tenant_gateway.ca_bundle_key,
+          var.tenant_gateway.ca_bundle_object_version, var.tenant_gateway.revocation_list_key,
+          var.tenant_gateway.revocation_list_object_version
+        ] : trimspace(value) != "" && value != "null"
+      ])
+      && var.tenant_gateway.backend_tls_secret_arn != ""
+      && var.tenant_gateway.registry_secret_arn != ""
+      && (var.tenant_gateway.callback_registry_secret_arn == null
+        ? length(var.tenant_gateway.callback_signing_secret_arns) == 0
+        : var.tenant_gateway.callback_registry_secret_arn != ""
+      )
+      && alltrue([
+        for arn in concat(compact([
+          var.tenant_gateway.backend_tls_secret_arn, var.tenant_gateway.registry_secret_arn,
+          var.tenant_gateway.callback_registry_secret_arn
+        ]), tolist(var.tenant_gateway.callback_signing_secret_arns)) : can(regex("^arn:aws[^:]*:secretsmanager:[^:*]+:[0-9]{12}:secret:[^*?]+$", arn))
+      ])
+    )
+    error_message = "Configure at least two ALB subnets, pinned CA and CRL versions, an HTTPS issuer, a valid token profile and capacity, and exact Secrets Manager ARNs."
+  }
+}

@@ -16,14 +16,27 @@ at import time once and silently retargeting a seeding script at production.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
+from ipaddress import IPv4Network, IPv6Network, ip_network
+from pathlib import Path
 from typing import Literal
 
+from shepherd_contracts.errors import ConfigurationError
 from shepherd_workflow.ports import DEFAULT_TABLE_PREFIX
+
+from shepherd_workflow_service.models.tenancy import (
+    TenantRegistry,
+    validate_https_url,
+    validate_identifier,
+)
 
 RuntimeMode = Literal["http", "lambda"]
 EventBusMode = Literal["in_process", "sqs", "outbox"]
 DbBackend = Literal["sqlite", "mysql"]
+ProxyNetwork = IPv4Network | IPv6Network
+_PRIVATE_NETWORKS = tuple(map(ip_network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                                           "fc00::/7")))
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +88,19 @@ class ServiceConfig:
     workflow_event_bus: str | None = None
     workflow_ingress_queue_url: str | None = None
     workflow_event_tenants: tuple[str, ...] = ()
+    auth_issuer: str | None = None
+    tenant_http_profile: bool = False
+    tenant_registry_json: str | None = None
+    tenant_registry_path: str | None = None
+    tenant_registry_secret_id: str | None = None
+    tenant_proxy_cidrs: tuple[str, ...] = ()
+    tenant_token_profile: Literal["rfc9068", "cognito"] = "rfc9068"
+    tenant_tls_secret_id: str | None = None
+    tenant_pool_capacity: int = 16
+    tenant_queue_age_seconds: int = 60
+    tenant_artifact_prefixes_json: str = "{}"
+    tenant_callback_destinations_json: str = "[]"
+    tenant_callback_destinations_secret_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.env:
@@ -85,6 +111,23 @@ class ServiceConfig:
             raise ValueError("event_bus_mode='sqs' requires sqs_queue_url")
         if self.workflow_job_deadline_seconds <= 0:
             raise ValueError("workflow_job_deadline_seconds must be positive")
+        if type(self.tenant_pool_capacity) is not int or self.tenant_pool_capacity <= 0:
+            raise ValueError("tenant_pool_capacity must be a positive integer")
+        if (
+            type(self.tenant_queue_age_seconds) is not int
+            or not 1 <= self.tenant_queue_age_seconds <= 604800
+        ):
+            raise ValueError("tenant_queue_age_seconds must be between 1 and 604800")
+        if self.tenant_token_profile not in ("rfc9068", "cognito"):
+            raise ValueError("invalid TENANT_TOKEN_PROFILE")
+        if sum(source is not None for source in (
+            self.tenant_registry_json, self.tenant_registry_path, self.tenant_registry_secret_id,
+        )) > 1:
+            raise ValueError("set only one tenant registry source")
+        if type(self.tenant_http_profile) is not bool:
+            raise ValueError("tenant_http_profile must be boolean")
+        if self.tenant_http_profile:
+            self._validate_tenant_profile()
         if self.db_backend == "mysql":
             # Enumerated and checked HERE rather than at first query: a service
             # missing its database name should die at startup, not on the first
@@ -103,6 +146,60 @@ class ServiceConfig:
             if missing:
                 raise ValueError(f"db_backend='mysql' requires {missing}")
 
+    def _validate_tenant_profile(self) -> None:
+        if self.runtime_mode != "http" or not self.workflow_catalog_path:
+            raise ValueError("tenant HTTP profile requires HTTP runtime and WORKFLOW_CATALOG_PATH")
+        if not (
+            self.tenant_registry_json or self.tenant_registry_path or self.tenant_registry_secret_id
+        ):
+            raise ValueError("tenant HTTP profile requires workload registry configuration")
+        if not self.auth_issuer or not self.auth_jwks_uri or not self.auth_audience:
+            raise ValueError(
+                "tenant HTTP profile requires AUTH_ISSUER, AUTH_JWKS_URI and AUTH_AUDIENCE"
+            )
+        validate_https_url(self.auth_issuer)
+        validate_https_url(self.auth_jwks_uri)
+        validate_identifier(self.auth_audience)
+        if self.auth_issuer == self.issuer:
+            raise ValueError("AUTH_ISSUER must differ from PRINCIPAL_ISSUER in tenant HTTP profile")
+        self.tenant_proxy_networks()
+
+    def tenant_proxy_networks(self) -> tuple[ProxyNetwork, ...]:
+        networks = tuple(ip_network(value, strict=True) for value in self.tenant_proxy_cidrs)
+        if not networks or any(
+            not any(n.version == allowed.version and n.subnet_of(allowed)
+                    for allowed in _PRIVATE_NETWORKS)
+            for n in networks
+        ):
+            raise ValueError("TENANT_PROXY_CIDRS requires explicit private proxy networks")
+        return networks
+
+    def load_tenant_registry(
+        self, *, read_secret: Callable[[str], str] | None = None
+    ) -> TenantRegistry | None:
+        if all(source is None for source in (
+            self.tenant_registry_json, self.tenant_registry_path, self.tenant_registry_secret_id,
+        )):
+            return None
+        try:
+            content = self.tenant_registry_json
+            if self.tenant_registry_path is not None:
+                content = Path(self.tenant_registry_path).read_text(encoding="utf-8")
+            if self.tenant_registry_secret_id is not None:
+                if read_secret is None:
+                    raise ConfigurationError("tenant workload registry has no secret provider")
+                content = read_secret(self.tenant_registry_secret_id)
+            registry = TenantRegistry.from_json(content or "")
+        except (ValueError, OSError, RuntimeError):
+            raise ConfigurationError("tenant workload registry could not be loaded") from None
+        if self.tenant_http_profile and any(
+            item.issuer != self.auth_issuer for item in registry.workloads
+        ):
+            raise ConfigurationError("tenant workload registry contains an unconfigured issuer")
+        if registry.tenant_ids.intersection(self.workflow_event_tenants):
+            raise ConfigurationError("HTTPS tenant cannot be enabled for legacy event consumption")
+        return registry
+
     @classmethod
     def from_environment(cls) -> ServiceConfig:
         """Read `ServiceConfig` from `os.environ`.
@@ -117,6 +214,9 @@ class ServiceConfig:
             runtime_mode = "lambda"
         else:
             runtime_mode = "http"
+        tenant_http_profile = os.environ.get("TENANT_HTTP_PROFILE", "false")
+        if tenant_http_profile not in ("true", "false"):
+            raise ValueError("TENANT_HTTP_PROFILE must be 'true' or 'false'")
 
         return cls(
             env=os.environ.get("SERVICE_ENV", "local"),
@@ -129,6 +229,24 @@ class ServiceConfig:
             aws_region=os.environ.get("AWS_REGION"),
             auth_jwks_uri=os.environ.get("AUTH_JWKS_URI"),
             auth_audience=os.environ.get("AUTH_AUDIENCE"),
+            auth_issuer=os.environ.get("AUTH_ISSUER"),
+            tenant_http_profile=tenant_http_profile == "true",
+            tenant_registry_json=os.environ.get("TENANT_REGISTRY_JSON"),
+            tenant_registry_path=os.environ.get("TENANT_REGISTRY_PATH"),
+            tenant_registry_secret_id=os.environ.get("TENANT_REGISTRY_SECRET_ID"),
+            tenant_proxy_cidrs=tuple(os.environ["TENANT_PROXY_CIDRS"].split(","))
+            if "TENANT_PROXY_CIDRS" in os.environ else (),
+            tenant_token_profile=os.environ.get("TENANT_TOKEN_PROFILE", "rfc9068"),
+            tenant_tls_secret_id=os.environ.get("TENANT_TLS_SECRET_ID"),
+            tenant_pool_capacity=int(os.environ.get("TENANT_POOL_CAPACITY", "16")),
+            tenant_queue_age_seconds=int(os.environ.get("TENANT_QUEUE_AGE_SECONDS", "60")),
+            tenant_artifact_prefixes_json=os.environ.get("TENANT_ARTIFACT_PREFIXES_JSON", "{}"),
+            tenant_callback_destinations_json=os.environ.get(
+                "TENANT_CALLBACK_DESTINATIONS_JSON", "[]"
+            ),
+            tenant_callback_destinations_secret_id=os.environ.get(
+                "TENANT_CALLBACK_DESTINATIONS_SECRET_ID"
+            ),
             db_backend=os.environ.get("DB_BACKEND", "sqlite"),  # type: ignore[arg-type]
             db_host=os.environ.get("DB_HOST"),
             db_port=int(os.environ["DB_PORT"]) if os.environ.get("DB_PORT") else None,
